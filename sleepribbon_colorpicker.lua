@@ -28,11 +28,13 @@ local _ = require("sleepribbon_i18n").gettext
 local M = {}
 
 local STANDARD_PALETTE = {
-    { "#000000", "#404040", "#808080", "#BFBFBF", "#FFFFFF" },
-    { "#C00000", "#FF6600", "#8B4513", "#B8860B", "#8B0000" },
-    { "#FF69B4", "#FFA07A", "#DEB887", "#FFD700", "#FF8C69" },
-    { "#0000CD", "#228B22", "#008B8B", "#8B008B", "#2F4F4F" },
-    { "#87CEEB", "#98FB98", "#DDA0DD", "#B0E0E6", "#FFB6C1" },
+    -- Fixed spectrum order: black -> red -> orange -> yellow -> green ->
+    -- cyan -> blue -> violet -> magenta -> neutrals -> white.
+    { "#000000", "#8B0000", "#C00000", "#8B4513", "#FF6600" },
+    { "#FF8C69", "#FFA07A", "#DEB887", "#B8860B", "#FFD700" },
+    { "#228B22", "#98FB98", "#2F4F4F", "#008B8B", "#87CEEB" },
+    { "#B0E0E6", "#0000CD", "#8B008B", "#DDA0DD", "#FF69B4" },
+    { "#FFB6C1", "#404040", "#808080", "#BFBFBF", "#FFFFFF" },
 }
 
 local function normalizeHex(value)
@@ -163,7 +165,7 @@ local ColorPicker = FocusManager:extend{
     apply_callback = nil,
     cover_palette_provider = nil,
     cover_palette = nil,
-    palette_mode = "standard",
+    palette_mode = "cover",
 }
 
 function ColorPicker:init()
@@ -173,6 +175,21 @@ function ColorPicker:init()
     self.swatch_gap = Screen:scaleBySize(8)
     self.selected_hex = normalizeHex(self.selected_hex) or "#FFFFFF"
     self.default_hex = normalizeHex(self.default_hex) or "#FFFFFF"
+
+    -- Cover is the default palette. Load it lazily when the picker is opened;
+    -- if no book/cover is available, fall back silently to Standard.
+    self.palette_mode = "cover"
+    if self.cover_palette_provider then
+        local palette = self.cover_palette_provider()
+        if type(palette) == "table" and #palette > 0 then
+            self.cover_palette = palette
+        else
+            self.palette_mode = "standard"
+        end
+    else
+        self.palette_mode = "standard"
+    end
+
     self:update()
 end
 
