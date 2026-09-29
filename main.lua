@@ -10,6 +10,7 @@
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local ConfirmBox = require("ui/widget/confirmbox")
+local CustomPositionContainer = require("ui/widget/container/custompositioncontainer")
 local DataStorage = require("datastorage")
 local datetime = require("datetime")
 local Device = require("device")
@@ -317,9 +318,11 @@ local SleepRibbon = WidgetContainer:extend{
 
 local active_instance
 local original_textbox_new
+local original_customposition_new
 local original_expand_string
 local original_screensaver_setup
 local patch_installed = false
+local position_opacity_hook_installed = false
 local expand_hook_installed = false
 local screensaver_profile_hook_installed = false
 
@@ -338,6 +341,7 @@ function SleepRibbon:init()
     self:initDefaults()
     active_instance = self
     self:installBannerHook()
+    self:installPositionOpacityHook()
     self:installExpandStringHook()
     self:installScreensaverProfileHook()
 
@@ -350,11 +354,39 @@ function SleepRibbon:init()
     end
 end
 
+function SleepRibbon:getCurrentBookFile()
+    local ui = self.ui
+    if ui and ui.document and ui.document.file then
+        return ui.document.file
+    end
+    return G_reader_settings:readSetting("lastfile")
+end
+
 function SleepRibbon:getCurrentDocSettings()
     local ui = self.ui
     if ui and ui.document and ui.doc_settings then
         return ui.doc_settings
     end
+
+    -- In File Manager there is no open document, but KOReader's sleep screen
+    -- still refers to lastfile. Use that book's sidecar so "Current book"
+    -- remains useful there too.
+    local file = self:getCurrentBookFile()
+    if not file then return nil end
+
+    if self._profile_doc_settings_file == file and self._profile_doc_settings then
+        return self._profile_doc_settings
+    end
+
+    local BookList = require("ui/widget/booklist")
+    if not BookList.hasBookBeenOpened(file) then return nil end
+
+    local doc_settings = BookList.getDocSettings(file)
+    if not doc_settings then return nil end
+
+    self._profile_doc_settings_file = file
+    self._profile_doc_settings = doc_settings
+    return doc_settings
 end
 
 function SleepRibbon:hasCurrentBook()
@@ -684,8 +716,6 @@ function SleepRibbon:installScreensaverProfileHook()
             end
             override("screensaver_message", message)
         end
-        override("screensaver_message_vertical_position", profile[BOOK_POSITION_KEY])
-        override("screensaver_message_alpha", profile[BOOK_OPACITY_KEY])
 
         if #saved == 0 then
             return original_screensaver_setup(screensaver, ...)
@@ -820,7 +850,10 @@ function SleepRibbon:buildRibbonWidget(text, width, progress, face_override)
     if bar and bar_position == "top" then table.insert(children, bar) end
     table.insert(children, text_body)
     if bar and bar_position == "bottom" then table.insert(children, bar) end
-    return VerticalGroup:new(children)
+
+    local ribbon = VerticalGroup:new(children)
+    ribbon.sleepribbon_widget = true
+    return ribbon
 end
 
 function SleepRibbon:isNativeBannerCandidate(settings)
@@ -844,6 +877,46 @@ function SleepRibbon:installBannerHook()
         return original_textbox_new(class, settings, ...)
     end
     patch_installed = true
+end
+
+
+function SleepRibbon:installPositionOpacityHook()
+    if position_opacity_hook_installed then return end
+    original_customposition_new = CustomPositionContainer.new
+
+    CustomPositionContainer.new = function(class, settings, ...)
+        local instance = active_instance
+        local widget = type(settings) == "table" and settings.widget or nil
+        if instance and instance:isEnabled()
+                and Device.screen_saver_mode
+                and widget and widget.sleepribbon_widget
+                and instance:isCurrentBookProfileEnabled() then
+            local profile = instance:getCurrentBookProfile()
+            if type(profile) == "table" then
+                local patched = {}
+                for key, value in pairs(settings) do
+                    patched[key] = value
+                end
+
+                if profile[BOOK_POSITION_KEY] ~= nil then
+                    local position = tonumber(profile[BOOK_POSITION_KEY]) or 50
+                    position = math.max(0, math.min(100, position))
+                    patched.vertical_position = 1 - (position / 100)
+                end
+
+                if profile[BOOK_OPACITY_KEY] ~= nil then
+                    local opacity = tonumber(profile[BOOK_OPACITY_KEY]) or 100
+                    opacity = math.max(0, math.min(100, opacity))
+                    patched.alpha = opacity / 100
+                end
+
+                settings = patched
+            end
+        end
+        return original_customposition_new(class, settings, ...)
+    end
+
+    position_opacity_hook_installed = true
 end
 
 -- ---------------------------------------------------------------------------
@@ -1889,7 +1962,8 @@ function SleepRibbon:getMenuItem()
                             self:spinSetting(
                                 "horizontal_padding",
                                 _("Horizontal padding"),
-                                0, 100, DEFAULTS.horizontal_padding, "px",
+                                0, math.max(100, math.floor((Screen:getWidth() - 1) / 2)),
+                                DEFAULTS.horizontal_padding, "px",
                                 touchmenu_instance
                             )
                         end,
