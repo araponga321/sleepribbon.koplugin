@@ -969,6 +969,199 @@ function SleepRibbon:refreshFonts()
 end
 
 -- ---------------------------------------------------------------------------
+-- Cover-derived color palette
+-- ---------------------------------------------------------------------------
+
+local function paletteRGB(r, g, b)
+    local function channel(value)
+        return math.max(0, math.min(255, math.floor((tonumber(value) or 0) + 0.5)))
+    end
+    return { r = channel(r), g = channel(g), b = channel(b) }
+end
+
+local function paletteHex(color)
+    return string.format("#%02X%02X%02X", color.r, color.g, color.b)
+end
+
+local function paletteDistance(a, b)
+    local dr = a.r - b.r
+    local dg = a.g - b.g
+    local db = a.b - b.b
+    return math.sqrt(dr * dr + dg * dg + db * db)
+end
+
+local function paletteLuminance(color)
+    return 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b
+end
+
+local function extractCoverPalette(cover_bb)
+    if not cover_bb then return nil end
+
+    local width = tonumber(cover_bb:getWidth()) or 0
+    local height = tonumber(cover_bb:getHeight()) or 0
+    if width <= 0 or height <= 0 then return nil end
+
+    -- Sample only a few thousand pixels. This is enough for representative
+    -- colors and keeps extraction cheap even when the source cover is large.
+    local target_samples = 5000
+    local step = math.max(1, math.floor(math.sqrt((width * height) / target_samples)))
+    local bins = {}
+
+    for y = 0, height - 1, step do
+        for x = 0, width - 1, step do
+            local pixel = cover_bb:getPixel(x, y)
+            if pixel and pixel.getColorRGB32 then
+                local rgb32 = pixel:getColorRGB32()
+                local red = tonumber(rgb32.r) or 0
+                local green = tonumber(rgb32.g) or 0
+                local blue = tonumber(rgb32.b) or 0
+
+                -- 4-bit/channel quantization groups tiny variations together
+                -- before representative colors are selected.
+                local qr = math.floor(red / 16)
+                local qg = math.floor(green / 16)
+                local qb = math.floor(blue / 16)
+                local key = qr * 256 + qg * 16 + qb
+                local bin = bins[key]
+                if not bin then
+                    bin = { count = 0, r = 0, g = 0, b = 0 }
+                    bins[key] = bin
+                end
+                bin.count = bin.count + 1
+                bin.r = bin.r + red
+                bin.g = bin.g + green
+                bin.b = bin.b + blue
+            end
+        end
+    end
+
+    local candidates = {}
+    for key, bin in pairs(bins) do
+        if bin.count > 0 then
+            table.insert(candidates, {
+                color = paletteRGB(
+                    bin.r / bin.count,
+                    bin.g / bin.count,
+                    bin.b / bin.count
+                ),
+                count = bin.count,
+                key = key,
+            })
+        end
+    end
+    table.sort(candidates, function(a, b)
+        if a.count == b.count then return a.key < b.key end
+        return a.count > b.count
+    end)
+
+    local selected = {}
+    local function addWithMinimumDistance(minimum_distance)
+        for candidate_index = 1, #candidates do
+            if #selected >= 25 then return end
+            local candidate = candidates[candidate_index].color
+            local distinct = true
+            for selected_index = 1, #selected do
+                if paletteDistance(candidate, selected[selected_index]) < minimum_distance then
+                    distinct = false
+                    break
+                end
+            end
+            if distinct then
+                table.insert(selected, candidate)
+            end
+        end
+    end
+
+    -- Start with strongly distinct colors, then progressively relax the
+    -- threshold so detailed/near-monochrome covers can still fill the grid.
+    addWithMinimumDistance(72)
+    addWithMinimumDistance(52)
+    addWithMinimumDistance(36)
+    addWithMinimumDistance(22)
+    addWithMinimumDistance(0)
+
+    table.sort(selected, function(a, b)
+        local la, lb = paletteLuminance(a), paletteLuminance(b)
+        if math.abs(la - lb) < 0.5 then
+            if a.r ~= b.r then return a.r < b.r end
+            if a.g ~= b.g then return a.g < b.g end
+            return a.b < b.b
+        end
+        return la < lb
+    end)
+
+    local palette = {}
+    for color_index = 1, math.min(25, #selected) do
+        palette[color_index] = paletteHex(selected[color_index])
+    end
+    return #palette > 0 and palette or nil
+end
+
+function SleepRibbon:getPaletteBookFile()
+    local ui = self.ui
+    return (ui and ui.document and ui.document.file)
+        or G_reader_settings:readSetting("lastfile")
+end
+
+function SleepRibbon:getCoverPaletteCache()
+    local cache = self.settings:readSetting("cover_palette_cache")
+    return type(cache) == "table" and cache or {}
+end
+
+function SleepRibbon:getCoverPalette(force_refresh)
+    local file = self:getPaletteBookFile()
+    if not file then
+        return nil, _("No book is available for a cover palette.")
+    end
+
+    local cache = self:getCoverPaletteCache()
+    local cached = cache[file]
+    if not force_refresh and type(cached) == "table" and #cached > 0 then
+        return cached
+    end
+
+    local bookinfo = self.ui and self.ui.bookinfo
+    if not bookinfo then
+        local ok, FileManagerBookInfo = pcall(require, "apps/filemanager/filemanagerbookinfo")
+        if ok then bookinfo = FileManagerBookInfo end
+    end
+    if not bookinfo or type(bookinfo.getCoverImage) ~= "function" then
+        return nil, _("No cover image is available for this book.")
+    end
+
+    local document = self.ui and self.ui.document
+    local ok_cover, cover_bb = pcall(bookinfo.getCoverImage, bookinfo, document, file)
+    if not ok_cover or not cover_bb then
+        return nil, _("No cover image is available for this book.")
+    end
+
+    local ok_palette, palette = pcall(extractCoverPalette, cover_bb)
+    if cover_bb.free then
+        pcall(cover_bb.free, cover_bb)
+    end
+    if not ok_palette or type(palette) ~= "table" or #palette == 0 then
+        if not ok_palette then
+            logger.warn("SleepRibbon: cover palette extraction failed:", palette)
+        end
+        return nil, _("Could not extract colors from the cover.")
+    end
+
+    cache[file] = palette
+    self.settings:saveSetting("cover_palette_cache", cache):flush()
+    return palette
+end
+
+function SleepRibbon:refreshCoverPalette(touchmenu_instance)
+    local palette, err = self:getCoverPalette(true)
+    if palette then
+        Notification:notify(_("Cover palette refreshed"))
+        if touchmenu_instance then touchmenu_instance:updateItems() end
+    else
+        UIManager:show(InfoMessage:new{ text = err or _("Could not extract colors from the cover.") })
+    end
+end
+
+-- ---------------------------------------------------------------------------
 -- Color picker / preview
 -- ---------------------------------------------------------------------------
 
@@ -1014,6 +1207,9 @@ function SleepRibbon:showColorPicker(setting_key, title, touchmenu_instance)
         title = title,
         value = self:read(setting_key),
         default_value = DEFAULTS[setting_key],
+        cover_palette_provider = function()
+            return self:getCoverPalette(false)
+        end,
         callback = function(value)
             self:save(setting_key, value)
             if touchmenu_instance then touchmenu_instance:updateItems() end
@@ -1274,6 +1470,13 @@ function SleepRibbon:getMenuItem()
                 callback = function(touchmenu_instance)
                     self:refreshFonts()
                     if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+            },
+            {
+                text = _("Refresh cover palette"),
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:refreshCoverPalette(touchmenu_instance)
                 end,
             },
             {
