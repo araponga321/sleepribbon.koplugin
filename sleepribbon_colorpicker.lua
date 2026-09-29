@@ -366,19 +366,19 @@ function ColorPicker:update()
         },
         HorizontalSpan:new{ width = Size.padding.large },
         paletteModeButton(
-            _("Standard"),
-            self.palette_mode == "standard",
-            selector_button_w,
-            selector_h,
-            function() self:_setPaletteMode("standard") end
-        ),
-        HorizontalSpan:new{ width = Size.padding.small },
-        paletteModeButton(
             _("Cover"),
             self.palette_mode == "cover",
             selector_button_w,
             selector_h,
             function() self:_setPaletteMode("cover") end
+        ),
+        HorizontalSpan:new{ width = Size.padding.small },
+        paletteModeButton(
+            _("Standard"),
+            self.palette_mode == "standard",
+            selector_button_w,
+            selector_h,
+            function() self:_setPaletteMode("standard") end
         ),
     }
 
