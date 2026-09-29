@@ -25,10 +25,6 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local LuaSettings = require("luasettings")
 local Notification = require("ui/widget/notification")
 local RenderText = require("ui/rendertext")
-local ReaderMenu = require("apps/reader/modules/readermenu")
-local FileManagerMenu = require("apps/filemanager/filemanagermenu")
-local ReaderMenuOrder = require("ui/elements/reader_menu_order")
-local FileManagerMenuOrder = require("ui/elements/filemanager_menu_order")
 local Screen = Device.screen
 local Size = require("ui/size")
 local SpinWidget = require("ui/widget/spinwidget")
@@ -318,8 +314,6 @@ local original_textbox_new
 local original_expand_string
 local patch_installed = false
 local expand_hook_installed = false
-local menu_hooks_installed = false
-local menu_instances = setmetatable({}, { __mode = "k" })
 
 function SleepRibbon:initDefaults()
     local changed = false
@@ -337,15 +331,12 @@ function SleepRibbon:init()
     active_instance = self
     self:installBannerHook()
     self:installExpandStringHook()
-    self:installMenuHooks()
 
+    -- Use KOReader's normal plugin menu registration lifecycle. addToMainMenu()
+    -- is called after the native menu_items table (including "screensaver")
+    -- has been created in both Reader and File Manager.
     if self.ui and self.ui.menu then
-        menu_instances[self.ui.menu] = self
-        -- Keep normal plugin registration/lifecycle, but menu placement itself
-        -- happens after KOReader has built the real menu tree.
         self.ui.menu:registerToMainMenu(self)
-        -- Force a rebuild on the next menu opening so the post-build hook runs.
-        self.ui.menu.tab_item_table = nil
     end
 end
 
@@ -1694,100 +1685,28 @@ function SleepRibbon:getMenuItem()
     }
 end
 
-local function findItemFromPath(menu, ...)
-    local function findSubItem(sub_items, text)
-        if type(sub_items) ~= "table" then return nil end
-        for _, item in ipairs(sub_items) do
-            local item_text = item.text or (item.text_func and item.text_func())
-            if item_text and item_text == text then
-                return item
-            end
-        end
-        return nil
+function SleepRibbon:addToMainMenu(menu_items)
+    -- ReaderMenu and FileManagerMenu both create menu_items.screensaver before
+    -- invoking registered plugins. Register directly into that stable native
+    -- submenu instead of walking translated labels or patching menu builders.
+    local screensaver = menu_items and menu_items.screensaver
+    local items = screensaver and screensaver.sub_item_table
+    if type(items) ~= "table" then
+        logger.warn("SleepRibbon: native screensaver menu is unavailable")
+        return
     end
 
-    local sub_items, item
-    for _, text in ipairs{ ... } do
-        sub_items = item and item.sub_item_table or menu
-        if not sub_items then return nil end
-        item = findSubItem(sub_items, text)
-        if not item then return nil end
-    end
-    return item
-end
-
-local function insertSleepRibbonInBuiltMenu(menu, order, instance)
-    if not (menu and order and instance and menu.tab_item_table) then return false end
-
-    local buttons = order["KOMenu:menu_buttons"]
-    if type(buttons) ~= "table" then return false end
-
-    for i, button in ipairs(buttons) do
-        if button == "setting" then
-            local setting_menu = menu.tab_item_table[i]
-            if setting_menu then
-                local sleep_screen = findItemFromPath(
-                    setting_menu,
-                    KO_("Screen"),
-                    KO_("Sleep screen")
-                )
-                local items = sleep_screen and sleep_screen.sub_item_table
-                if type(items) ~= "table" then return false end
-
-                -- Idempotent: the final menu tree may be rebuilt more than once.
-                for _, item in ipairs(items) do
-                    if item.text == "SleepRibbon" then return true end
-                end
-
-                local insert_at = #items + 1
-                for idx, item in ipairs(items) do
-                    local item_text = item.text or (item.text_func and item.text_func())
-                    if item_text == KO_("Container and position") then
-                        insert_at = idx + 1
-                        break
-                    end
-                end
-
-                table.insert(items, insert_at, instance:getMenuItem())
-                return true
-            end
+    -- Defensive idempotency in case KOReader (or another integration) invokes
+    -- addToMainMenu more than once against the same menu table.
+    for _, item in ipairs(items) do
+        if item.sleepribbon_menu_item then
+            return
         end
     end
-    return false
-end
 
-function SleepRibbon:installMenuHooks()
-    if menu_hooks_installed then return end
-
-    local original_reader_set = ReaderMenu.setUpdateItemTable
-    ReaderMenu.setUpdateItemTable = function(menu, ...)
-        local result = original_reader_set(menu, ...)
-        local instance = menu_instances[menu] or active_instance
-        if instance then
-            local ok, err = pcall(insertSleepRibbonInBuiltMenu, menu, ReaderMenuOrder, instance)
-            if not ok then logger.warn("SleepRibbon: Reader menu injection failed:", err) end
-        end
-        return result
-    end
-
-    local original_filemanager_set = FileManagerMenu.setUpdateItemTable
-    FileManagerMenu.setUpdateItemTable = function(menu, ...)
-        local result = original_filemanager_set(menu, ...)
-        local instance = menu_instances[menu] or active_instance
-        if instance then
-            local ok, err = pcall(insertSleepRibbonInBuiltMenu, menu, FileManagerMenuOrder, instance)
-            if not ok then logger.warn("SleepRibbon: File Manager menu injection failed:", err) end
-        end
-        return result
-    end
-
-    menu_hooks_installed = true
-end
-
-function SleepRibbon:addToMainMenu(_menu_items)
-    -- Intentionally empty. SleepRibbon is injected only after KOReader has
-    -- built the real menu tree, so it appears at:
-    -- Settings > Screen > Sleep screen > SleepRibbon.
+    local item = self:getMenuItem()
+    item.sleepribbon_menu_item = true
+    table.insert(items, item)
 end
 
 return SleepRibbon
