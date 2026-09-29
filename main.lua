@@ -70,6 +70,9 @@ local DEFAULTS = {
     progress_height = 3,
     progress_color = "#FFFFFF",
     remainder_color = "#404040",
+
+    -- Used only by the on-demand automatic color-scheme generator.
+    auto_layout = "background_completed",
 }
 
 local function normalizeHex(value)
@@ -510,14 +513,21 @@ function SleepRibbon:getProgress(expanded_text)
     return 0
 end
 
-function SleepRibbon:buildRibbonWidget(text, width, progress, face_override)
-    local background_enabled = self:read("background_enabled") and true or false
-    local background = colorFromHex(self:read("background_color"))
-    local foreground = colorFromHex(self:read("text_color"))
-    local vertical_padding = math.max(0, tonumber(self:read("vertical_padding")) or 0)
-    local horizontal_padding = math.max(0, tonumber(self:read("horizontal_padding")) or 0)
+function SleepRibbon:buildRibbonWidget(text, width, progress, face_override, style_overrides)
+    local function style(key)
+        if style_overrides and style_overrides[key] ~= nil then
+            return style_overrides[key]
+        end
+        return self:read(key)
+    end
 
-    local alignment = tostring(self:read("text_alignment") or "center")
+    local background_enabled = style("background_enabled") and true or false
+    local background = colorFromHex(style("background_color"))
+    local foreground = colorFromHex(style("text_color"))
+    local vertical_padding = math.max(0, tonumber(style("vertical_padding")) or 0)
+    local horizontal_padding = math.max(0, tonumber(style("horizontal_padding")) or 0)
+
+    local alignment = tostring(style("text_alignment") or "center")
     if alignment ~= "left" and alignment ~= "center" and alignment ~= "right" then
         alignment = "center"
     end
@@ -528,9 +538,9 @@ function SleepRibbon:buildRibbonWidget(text, width, progress, face_override)
     horizontal_padding = math.min(horizontal_padding, max_hpad)
     local text_width = math.max(1, width - 2 * horizontal_padding)
 
-    local bar_enabled = self:read("progress_enabled") and true or false
-    local bar_height = bar_enabled and math.max(0, tonumber(self:read("progress_height")) or 0) or 0
-    local bar_position = self:read("progress_position") == "bottom" and "bottom" or "top"
+    local bar_enabled = style("progress_enabled") and true or false
+    local bar_height = bar_enabled and math.max(0, tonumber(style("progress_height")) or 0) or 0
+    local bar_position = style("progress_position") == "bottom" and "bottom" or "top"
 
     local text_widget
     if background_enabled then
@@ -588,9 +598,9 @@ function SleepRibbon:buildRibbonWidget(text, width, progress, face_override)
             width = width,
             height = bar_height,
             progress = progress or 0,
-            fill_color = colorFromHex(self:read("progress_color")),
-            remainder_color = colorFromHex(self:read("remainder_color")),
-            show_remainder = self:read("progress_show_remainder") and true or false,
+            fill_color = colorFromHex(style("progress_color")),
+            remainder_color = colorFromHex(style("remainder_color")),
+            show_remainder = style("progress_show_remainder") and true or false,
         }
     end
 
@@ -969,6 +979,649 @@ function SleepRibbon:refreshFonts()
 end
 
 -- ---------------------------------------------------------------------------
+-- Automatic color schemes (on-demand, cached per book)
+-- ---------------------------------------------------------------------------
+
+local AUTO_LAYOUTS = {
+    { key = "text", label = "Text only", background = false, progress = false, remainder = false },
+    { key = "background", label = "Text + background", background = true, progress = false, remainder = false },
+    { key = "completed", label = "Text + completed bar", background = false, progress = true, remainder = false },
+    { key = "full", label = "Text + full bar", background = false, progress = true, remainder = true },
+    { key = "background_completed", label = "Text + background + completed bar", background = true, progress = true, remainder = false },
+    { key = "background_full", label = "Text + background + full bar", background = true, progress = true, remainder = true },
+}
+
+local function autoLayoutByKey(key)
+    for _, layout in ipairs(AUTO_LAYOUTS) do
+        if layout.key == key then return layout end
+    end
+    return AUTO_LAYOUTS[5]
+end
+
+local function clamp(value, min_value, max_value)
+    return math.max(min_value, math.min(max_value, value))
+end
+
+local function rgbColor(r, g, b)
+    return {
+        r = clamp(math.floor((tonumber(r) or 0) + 0.5), 0, 255),
+        g = clamp(math.floor((tonumber(g) or 0) + 0.5), 0, 255),
+        b = clamp(math.floor((tonumber(b) or 0) + 0.5), 0, 255),
+    }
+end
+
+local function hexFromRGB(color)
+    return string.format("#%02X%02X%02X", color.r, color.g, color.b)
+end
+
+local function mixRGB(a, b, amount)
+    return rgbColor(
+        a.r + (b.r - a.r) * amount,
+        a.g + (b.g - a.g) * amount,
+        a.b + (b.b - a.b) * amount
+    )
+end
+
+local function colorDistance(a, b)
+    local dr, dg, db = a.r - b.r, a.g - b.g, a.b - b.b
+    return math.sqrt(dr * dr + dg * dg + db * db)
+end
+
+local function channelLuminance(v)
+    v = v / 255
+    if v <= 0.04045 then return v / 12.92 end
+    return ((v + 0.055) / 1.055) ^ 2.4
+end
+
+local function relativeLuminance(color)
+    return 0.2126 * channelLuminance(color.r)
+        + 0.7152 * channelLuminance(color.g)
+        + 0.0722 * channelLuminance(color.b)
+end
+
+local function contrastRatio(a, b)
+    local l1, l2 = relativeLuminance(a), relativeLuminance(b)
+    if l2 > l1 then l1, l2 = l2, l1 end
+    return (l1 + 0.05) / (l2 + 0.05)
+end
+
+local function colorSaturation(color)
+    local maxc = math.max(color.r, color.g, color.b)
+    local minc = math.min(color.r, color.g, color.b)
+    if maxc == 0 then return 0 end
+    return (maxc - minc) / maxc
+end
+
+local function paletteFromPixels(pixels)
+    local bins = {}
+    for _, color in ipairs(pixels or {}) do
+        local qr = math.floor(color.r / 32)
+        local qg = math.floor(color.g / 32)
+        local qb = math.floor(color.b / 32)
+        local key = qr * 64 + qg * 8 + qb
+        local bin = bins[key]
+        if not bin then
+            bin = { count = 0, r = 0, g = 0, b = 0 }
+            bins[key] = bin
+        end
+        bin.count = bin.count + 1
+        bin.r = bin.r + color.r
+        bin.g = bin.g + color.g
+        bin.b = bin.b + color.b
+    end
+
+    local sorted = {}
+    for _, bin in pairs(bins) do
+        table.insert(sorted, bin)
+    end
+    table.sort(sorted, function(a, b) return a.count > b.count end)
+
+    local palette = {}
+    for i = 1, math.min(14, #sorted) do
+        local bin = sorted[i]
+        table.insert(palette, rgbColor(bin.r / bin.count, bin.g / bin.count, bin.b / bin.count))
+    end
+    return palette
+end
+
+local function addUniqueColor(list, color, minimum_distance)
+    for _, existing in ipairs(list) do
+        if colorDistance(existing, color) < (minimum_distance or 28) then
+            return
+        end
+    end
+    table.insert(list, color)
+end
+
+local function candidateColors(palette)
+    local colors = {}
+    addUniqueColor(colors, rgbColor(0, 0, 0), 1)
+    addUniqueColor(colors, rgbColor(255, 255, 255), 1)
+    for _, color in ipairs(palette or {}) do
+        addUniqueColor(colors, color)
+        addUniqueColor(colors, mixRGB(color, rgbColor(255, 255, 255), 0.38))
+        addUniqueColor(colors, mixRGB(color, rgbColor(0, 0, 0), 0.38))
+    end
+    return colors
+end
+
+local function contrastScore(candidate, pixels)
+    if not pixels or #pixels == 0 then return 0 end
+    local pass, sum, minimum = 0, 0, math.huge
+    for _, bg in ipairs(pixels) do
+        local ratio = contrastRatio(candidate, bg)
+        if ratio >= 4.5 then pass = pass + 1 end
+        sum = sum + math.min(ratio, 12)
+        if ratio < minimum then minimum = ratio end
+    end
+    local pass_ratio = pass / #pixels
+    local average = sum / #pixels
+    return pass_ratio * 100 + average * 3 + math.min(minimum, 4.5)
+end
+
+local function rankedContrastColors(pixels, palette, count)
+    local ranked = {}
+    for _, color in ipairs(candidateColors(palette)) do
+        table.insert(ranked, { color = color, score = contrastScore(color, pixels) })
+    end
+    table.sort(ranked, function(a, b) return a.score > b.score end)
+
+    local result = {}
+    for _, entry in ipairs(ranked) do
+        local distinct = true
+        for _, chosen in ipairs(result) do
+            if colorDistance(chosen, entry.color) < 72 then
+                distinct = false
+                break
+            end
+        end
+        if distinct then
+            table.insert(result, entry.color)
+            if #result >= count then break end
+        end
+    end
+
+    -- Very monochrome covers may not yield enough distinct safe candidates.
+    for _, entry in ipairs(ranked) do
+        if #result >= count then break end
+        addUniqueColor(result, entry.color, 28)
+    end
+    return result
+end
+
+local function chooseForeground(background)
+    local black, white = rgbColor(0, 0, 0), rgbColor(255, 255, 255)
+    if contrastRatio(white, background) >= contrastRatio(black, background) then
+        return white
+    end
+    return black
+end
+
+local function backgroundCandidates(palette)
+    local black, white = rgbColor(0, 0, 0), rgbColor(255, 255, 255)
+    if not palette or #palette == 0 then
+        return { rgbColor(32, 32, 32), rgbColor(232, 232, 232), black, white }
+    end
+
+    local dominant = palette[1]
+    local darkest, lightest, accent = dominant, dominant, dominant
+    local darkest_l, lightest_l = relativeLuminance(dominant), relativeLuminance(dominant)
+    local accent_score = -1
+
+    for _, color in ipairs(palette) do
+        local lum = relativeLuminance(color)
+        if lum < darkest_l then darkest, darkest_l = color, lum end
+        if lum > lightest_l then lightest, lightest_l = color, lum end
+        local sat = colorSaturation(color)
+        local score = sat * (1 - math.abs(lum - 0.45))
+        if score > accent_score then accent, accent_score = color, score end
+    end
+
+    local candidates = {}
+    addUniqueColor(candidates, dominant)
+    addUniqueColor(candidates, mixRGB(darkest, black, 0.28))
+    addUniqueColor(candidates, mixRGB(lightest, white, 0.20))
+    addUniqueColor(candidates, accent)
+
+    -- Guarantee four visibly distinct choices when the source palette is sparse.
+    addUniqueColor(candidates, mixRGB(dominant, black, 0.55))
+    addUniqueColor(candidates, mixRGB(dominant, white, 0.55))
+    addUniqueColor(candidates, black)
+    addUniqueColor(candidates, white)
+    while #candidates > 4 do table.remove(candidates) end
+    return candidates
+end
+
+function SleepRibbon:getCurrentBookFile()
+    return (self.ui and self.ui.document and self.ui.document.file)
+        or G_reader_settings:readSetting("lastfile")
+end
+
+function SleepRibbon:getAutoLayout()
+    return autoLayoutByKey(self:read("auto_layout"))
+end
+
+function SleepRibbon:autoLayoutOverrides(layout, colors)
+    layout = layout or self:getAutoLayout()
+    colors = colors or {}
+    return {
+        background_enabled = layout.background,
+        progress_enabled = layout.progress,
+        progress_show_remainder = layout.remainder,
+        text_color = colors.text_color or self:read("text_color"),
+        background_color = colors.background_color or self:read("background_color"),
+        progress_color = colors.progress_color or self:read("progress_color"),
+        remainder_color = colors.remainder_color or self:read("remainder_color"),
+    }
+end
+
+function SleepRibbon:getAutoSchemeCache()
+    local cache = self.settings:readSetting("auto_scheme_cache")
+    return type(cache) == "table" and cache or {}
+end
+
+function SleepRibbon:getCachedAutoSchemes()
+    local file = self:getCurrentBookFile()
+    if not file then return nil end
+    local entry = self:getAutoSchemeCache()[file]
+    return type(entry) == "table" and entry or nil
+end
+
+function SleepRibbon:saveCachedAutoSchemes(entry)
+    local file = self:getCurrentBookFile()
+    if not file then return end
+    local cache = self:getAutoSchemeCache()
+    cache[file] = entry
+    self.settings:saveSetting("auto_scheme_cache", cache):flush()
+end
+
+function SleepRibbon:clearCachedAutoSchemes()
+    local file = self:getCurrentBookFile()
+    if not file then return end
+    local cache = self:getAutoSchemeCache()
+    cache[file] = nil
+    self.settings:saveSetting("auto_scheme_cache", cache):flush()
+end
+
+function SleepRibbon:getAutoLayoutSignature(layout)
+    layout = layout or self:getAutoLayout()
+    local parts = {
+        layout.key,
+        tostring(G_reader_settings:readSetting("screensaver_message_vertical_position", 50)),
+        tostring(self:read("use_ui_font")),
+        tostring(self:read("font_path")),
+        tostring(self:read("font_index")),
+        tostring(self:read("font_size")),
+        tostring(self:read("text_alignment")),
+        tostring(self:read("horizontal_padding")),
+        tostring(self:read("vertical_padding")),
+        tostring(self:read("progress_position")),
+        tostring(self:read("progress_height")),
+        tostring(self:getPreviewMessage()),
+    }
+    return table.concat(parts, "|")
+end
+
+function SleepRibbon:getAutoAnalysisGeometry(layout)
+    local screen_w, screen_h = Screen:getWidth(), Screen:getHeight()
+    local text = self:getPreviewMessage()
+    local overrides = self:autoLayoutOverrides(layout)
+    local ribbon = self:buildRibbonWidget(text, screen_w, self:getProgress(text), nil, overrides)
+    local ribbon_h = math.max(1, ribbon:getSize().h)
+
+    local vertical_percentage = tonumber(G_reader_settings:readSetting("screensaver_message_vertical_position", 50)) or 50
+    local vertical_position = 1 - (vertical_percentage / 100)
+    local y0 = math.floor((screen_h - ribbon_h) * vertical_position)
+    y0 = clamp(y0, 0, math.max(0, screen_h - ribbon_h))
+    local y1 = math.min(screen_h - 1, y0 + ribbon_h - 1)
+
+    local hpad = clamp(tonumber(self:read("horizontal_padding")) or 0, 0, math.floor((screen_w - 1) / 2))
+    local usable_w = math.max(1, screen_w - 2 * hpad)
+    local text_w = usable_w
+    if not tostring(text):find("\n", 1, true) then
+        local ok, widget = pcall(TextWidget.new, TextWidget, {
+            text = text,
+            face = self:getConfiguredFace(),
+        })
+        if ok and widget and widget.getWidth then
+            text_w = clamp(widget:getWidth(), 1, usable_w)
+        end
+    end
+
+    local alignment = tostring(self:read("text_alignment") or "center")
+    local text_x0
+    if alignment == "left" then
+        text_x0 = hpad
+    elseif alignment == "right" then
+        text_x0 = screen_w - hpad - text_w
+    else
+        text_x0 = math.floor((screen_w - text_w) / 2)
+    end
+    text_x0 = clamp(text_x0 - 4, 0, screen_w - 1)
+    local text_x1 = clamp(text_x0 + text_w + 8, text_x0, screen_w - 1)
+
+    local bar_h = layout.progress and math.max(1, tonumber(self:read("progress_height")) or 1) or 0
+    local bar_y0, bar_y1 = y0, y1
+    if layout.progress then
+        if self:read("progress_position") == "bottom" then
+            bar_y0 = math.max(y0, y1 - bar_h + 1)
+            bar_y1 = y1
+        else
+            bar_y0 = y0
+            bar_y1 = math.min(y1, y0 + bar_h - 1)
+        end
+    end
+
+    return {
+        screen_w = screen_w,
+        screen_h = screen_h,
+        ribbon = { x0 = 0, y0 = y0, x1 = screen_w - 1, y1 = y1 },
+        text = { x0 = text_x0, y0 = y0, x1 = text_x1, y1 = y1 },
+        bar = { x0 = 0, y0 = bar_y0, x1 = screen_w - 1, y1 = bar_y1 },
+    }
+end
+
+local function coverMapping(bb, screen_w, screen_h)
+    local image_w, image_h = bb:getWidth(), bb:getHeight()
+    local fit = G_reader_settings:isFalse("screensaver_stretch_images")
+
+    if not fit then
+        local limit = G_reader_settings:readSetting("screensaver_stretch_limit_percentage")
+        if limit ~= nil then
+            local screen_ratio = screen_w / screen_h
+            local image_ratio = image_w / image_h
+            local divergence = math.abs(100 - image_ratio / screen_ratio * 100)
+            if divergence > tonumber(limit) then fit = true end
+        end
+    end
+
+    if fit then
+        local scale = math.min(screen_w / image_w, screen_h / image_h)
+        local shown_w, shown_h = image_w * scale, image_h * scale
+        local ox, oy = (screen_w - shown_w) / 2, (screen_h - shown_h) / 2
+        return function(x, y)
+            if x < ox or y < oy or x >= ox + shown_w or y >= oy + shown_h then
+                return nil
+            end
+            return clamp(math.floor((x - ox) / scale), 0, image_w - 1),
+                clamp(math.floor((y - oy) / scale), 0, image_h - 1)
+        end
+    end
+
+    return function(x, y)
+        return clamp(math.floor(x / screen_w * image_w), 0, image_w - 1),
+            clamp(math.floor(y / screen_h * image_h), 0, image_h - 1)
+    end
+end
+
+local function sampleMappedRegion(bb, map_point, rect, target_samples)
+    local pixels = {}
+    local width = math.max(1, rect.x1 - rect.x0 + 1)
+    local height = math.max(1, rect.y1 - rect.y0 + 1)
+    local target = math.max(64, target_samples or 500)
+    local step = math.max(1, math.floor(math.sqrt((width * height) / target)))
+
+    for y = rect.y0, rect.y1, step do
+        for x = rect.x0, rect.x1, step do
+            local sx, sy = map_point(x, y)
+            if sx and sy then
+                local ok, pixel = pcall(bb.getPixel, bb, sx, sy)
+                if ok and pixel and pixel.getColorRGB32 then
+                    local rgb = pixel:getColorRGB32()
+                    table.insert(pixels, rgbColor(rgb.r, rgb.g, rgb.b))
+                end
+            end
+        end
+    end
+    return pixels
+end
+
+local function schemeProgressColors(background, palette, local_pixels, index)
+    local source_pixels = local_pixels
+    if background then
+        source_pixels = {}
+        for _ = 1, 64 do table.insert(source_pixels, background) end
+    end
+    local ranked = rankedContrastColors(source_pixels, palette, 6)
+    local first = ranked[((index - 1) % math.max(1, #ranked)) + 1] or chooseForeground(background or rgbColor(127, 127, 127))
+    local second = nil
+    for _, color in ipairs(ranked) do
+        if colorDistance(first, color) >= 80 then
+            second = color
+            break
+        end
+    end
+    second = second or mixRGB(first, chooseForeground(first), 0.55)
+    return first, second
+end
+
+function SleepRibbon:generateAutoColorSchemes(touchmenu_instance)
+    local file = self:getCurrentBookFile()
+    if not file or not self.ui or not self.ui.bookinfo then
+        UIManager:show(InfoMessage:new{ text = _("Open a book before generating color schemes.") })
+        return
+    end
+
+    local ok_cover, cover = pcall(self.ui.bookinfo.getCoverImage, self.ui.bookinfo, self.ui.document, file)
+    if not ok_cover or not cover then
+        UIManager:show(InfoMessage:new{ text = _("No cover image is available for this book.") })
+        return
+    end
+
+    local layout = self:getAutoLayout()
+    local geometry = self:getAutoAnalysisGeometry(layout)
+    local map_point = coverMapping(cover, geometry.screen_w, geometry.screen_h)
+
+    local ok_generate, result = pcall(function()
+        local whole = sampleMappedRegion(cover, map_point, {
+            x0 = 0, y0 = 0, x1 = geometry.screen_w - 1, y1 = geometry.screen_h - 1,
+        }, 850)
+        local local_text = sampleMappedRegion(cover, map_point, geometry.text, 450)
+        local local_band = sampleMappedRegion(cover, map_point, geometry.ribbon, 650)
+        local local_bar = sampleMappedRegion(cover, map_point, geometry.bar, 450)
+
+        if #whole == 0 then error("cover sampling returned no pixels") end
+        if #local_text == 0 then local_text = whole end
+        if #local_band == 0 then local_band = whole end
+        if #local_bar == 0 then local_bar = local_band end
+
+        local palette = paletteFromPixels(whole)
+        local schemes = {}
+
+        if layout.background then
+            local backgrounds = backgroundCandidates(palette)
+            for i = 1, 4 do
+                local background = backgrounds[i] or backgrounds[1] or rgbColor(0, 0, 0)
+                local text_color = chooseForeground(background)
+                local progress_color, remainder_color = schemeProgressColors(
+                    background, palette, local_bar, i
+                )
+                table.insert(schemes, {
+                    name = _("Scheme") .. " " .. tostring(i),
+                    settings = self:autoLayoutOverrides(layout, {
+                        text_color = hexFromRGB(text_color),
+                        background_color = hexFromRGB(background),
+                        progress_color = hexFromRGB(progress_color),
+                        remainder_color = hexFromRGB(remainder_color),
+                    }),
+                })
+            end
+        else
+            local text_colors = rankedContrastColors(local_text, palette, 4)
+            local progress_colors = rankedContrastColors(local_bar, palette, 6)
+            for i = 1, 4 do
+                local text_color = text_colors[i] or text_colors[1] or rgbColor(255, 255, 255)
+                local progress_color = progress_colors[((i - 1) % math.max(1, #progress_colors)) + 1]
+                    or text_color
+                local remainder_color = nil
+                for _, color in ipairs(progress_colors) do
+                    if colorDistance(progress_color, color) >= 80 then
+                        remainder_color = color
+                        break
+                    end
+                end
+                remainder_color = remainder_color or mixRGB(progress_color, chooseForeground(progress_color), 0.55)
+
+                table.insert(schemes, {
+                    name = _("Scheme") .. " " .. tostring(i),
+                    settings = self:autoLayoutOverrides(layout, {
+                        text_color = hexFromRGB(text_color),
+                        progress_color = hexFromRGB(progress_color),
+                        remainder_color = hexFromRGB(remainder_color),
+                    }),
+                })
+            end
+        end
+
+        return {
+            layout = layout.key,
+            layout_signature = self:getAutoLayoutSignature(layout),
+            cover_signature = tostring(cover:getWidth()) .. "x" .. tostring(cover:getHeight()),
+            schemes = schemes,
+        }
+    end)
+
+    if cover.free then cover:free() end
+
+    if not ok_generate then
+        logger.warn("SleepRibbon: automatic color generation failed:", result)
+        UIManager:show(InfoMessage:new{ text = _("Color-scheme generation failed for this cover.") })
+        return
+    end
+
+    self:saveCachedAutoSchemes(result)
+    Notification:notify(_("Generated 4 color schemes"))
+    if touchmenu_instance then touchmenu_instance:updateItems() end
+end
+
+function SleepRibbon:showAutoSchemePreview(scheme)
+    if not scheme or type(scheme.settings) ~= "table" then return end
+    local width = math.floor(Screen:getWidth() * 0.82)
+    local preview_text = self:getPreviewMessage()
+    local ribbon = self:buildRibbonWidget(
+        preview_text,
+        width,
+        self:getProgress(preview_text),
+        nil,
+        scheme.settings
+    )
+    local preview = PreviewDialog:new{ ribbon_widget = ribbon }
+    UIManager:nextTick(function() UIManager:show(preview) end)
+end
+
+function SleepRibbon:applyAutoScheme(scheme, touchmenu_instance)
+    if not scheme or type(scheme.settings) ~= "table" then return end
+    for key, value in pairs(scheme.settings) do
+        self.settings:saveSetting(key, value)
+    end
+    self.settings:flush()
+    Notification:notify(_("Color scheme applied"))
+    if touchmenu_instance then touchmenu_instance:updateItems() end
+end
+
+function SleepRibbon:buildGeneratedSchemesMenu()
+    local entry = self:getCachedAutoSchemes()
+    if not entry or type(entry.schemes) ~= "table" then
+        return { { text = _("No generated schemes for this book"), enabled = false } }
+    end
+
+    local menu = {}
+    local layout = autoLayoutByKey(entry.layout)
+    if entry.layout_signature ~= self:getAutoLayoutSignature(layout) then
+        table.insert(menu, {
+            text = _("Layout changed since these schemes were generated"),
+            help_text = _("You can still preview or apply them, or regenerate them for the current layout."),
+            enabled = false,
+            separator = true,
+        })
+    end
+
+    for index, scheme_entry in ipairs(entry.schemes) do
+        local scheme = scheme_entry
+        table.insert(menu, {
+            text = scheme.name or (_("Scheme") .. " " .. tostring(index)),
+            sub_item_table = {
+                {
+                    text = _("Preview"),
+                    keep_menu_open = true,
+                    callback = function() self:showAutoSchemePreview(scheme) end,
+                },
+                {
+                    text = _("Apply"),
+                    keep_menu_open = true,
+                    callback = function(touchmenu_instance)
+                        self:applyAutoScheme(scheme, touchmenu_instance)
+                    end,
+                },
+            },
+        })
+    end
+    return menu
+end
+
+function SleepRibbon:buildAutoColorMenu()
+    local selected = self:getAutoLayout()
+    local cached = self:getCachedAutoSchemes()
+    local menu = {
+        {
+            text_func = function()
+                return _("Format") .. ": " .. _(self:getAutoLayout().label)
+            end,
+            sub_item_table_func = function()
+                local layouts = {}
+                for _, layout_entry in ipairs(AUTO_LAYOUTS) do
+                    local layout = layout_entry
+                    table.insert(layouts, {
+                        text = _(layout.label),
+                        radio = true,
+                        keep_menu_open = true,
+                        checked_func = function() return self:getAutoLayout().key == layout.key end,
+                        callback = function(touchmenu_instance)
+                            self:save("auto_layout", layout.key)
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                        end,
+                    })
+                end
+                return layouts
+            end,
+            separator = true,
+        },
+        {
+            text = cached and _("Regenerate schemes") or _("Generate schemes"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self:generateAutoColorSchemes(touchmenu_instance)
+            end,
+        },
+        {
+            text_func = function()
+                local entry = self:getCachedAutoSchemes()
+                local label = _("Generated schemes")
+                if entry and entry.layout_signature ~= self:getAutoLayoutSignature(autoLayoutByKey(entry.layout)) then
+                    label = label .. " (" .. _("layout changed") .. ")"
+                end
+                return label
+            end,
+            enabled_func = function() return self:getCachedAutoSchemes() ~= nil end,
+            sub_item_table_func = function() return self:buildGeneratedSchemesMenu() end,
+            separator = true,
+        },
+        {
+            text = _("Clear schemes for this book"),
+            enabled_func = function() return self:getCachedAutoSchemes() ~= nil end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self:clearCachedAutoSchemes()
+                Notification:notify(_("Cached schemes cleared"))
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        },
+    }
+    return menu
+end
+
+
+-- ---------------------------------------------------------------------------
 -- Color picker / preview
 -- ---------------------------------------------------------------------------
 
@@ -1079,6 +1732,12 @@ function SleepRibbon:getMenuItem()
                 text = _("Preview"),
                 keep_menu_open = true,
                 callback = function() self:showPreview() end,
+                separator = true,
+            },
+            {
+                text = _("Automatic color schemes"),
+                help_text = _("Generate cover-based color suggestions for the current layout and banner position."),
+                sub_item_table_func = function() return self:buildAutoColorMenu() end,
                 separator = true,
             },
             {
