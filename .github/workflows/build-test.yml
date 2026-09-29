@@ -1,0 +1,43 @@
+name: Build SleepRibbon test ZIP
+
+on:
+  push:
+    branches:
+      - auto-colors-test
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Lua 5.1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.1
+
+      - name: Syntax check
+        run: |
+          luac5.1 -p main.lua
+          luac5.1 -p sleepribbon_colorpicker.lua
+          luac5.1 -p sleepribbon_i18n.lua
+          luac5.1 -p _meta.lua
+
+      - name: Build install ZIP
+        run: |
+          mkdir -p build/sleepribbon.koplugin
+          cp _meta.lua main.lua sleepribbon_colorpicker.lua sleepribbon_i18n.lua LICENSE build/sleepribbon.koplugin/
+          cd build
+          zip -r ../SleepRibbon-auto-colors-test.zip sleepribbon.koplugin
+
+      - name: Upload test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: SleepRibbon-auto-colors-test
+          path: SleepRibbon-auto-colors-test.zip
+          if-no-files-found: error
