@@ -3,7 +3,7 @@ name: Build SleepRibbon cover palette test
 on:
   push:
     branches:
-      - cover-palette-test
+      - cover-palette-test-v2
   workflow_dispatch:
 
 permissions:
@@ -33,11 +33,11 @@ jobs:
           mkdir -p build/sleepribbon.koplugin
           cp _meta.lua main.lua sleepribbon_colorpicker.lua sleepribbon_i18n.lua LICENSE build/sleepribbon.koplugin/
           cd build
-          zip -r ../SleepRibbon-cover-palette-test.zip sleepribbon.koplugin
+          zip -r ../SleepRibbon-cover-palette-v2-test.zip sleepribbon.koplugin
 
       - name: Upload test build
         uses: actions/upload-artifact@v4
         with:
-          name: SleepRibbon-cover-palette-test
-          path: SleepRibbon-cover-palette-test.zip
+          name: SleepRibbon-cover-palette-v2-test
+          path: SleepRibbon-cover-palette-v2-test.zip
           if-no-files-found: error
