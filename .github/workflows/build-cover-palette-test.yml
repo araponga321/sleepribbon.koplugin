@@ -1,9 +1,9 @@
-name: Build SleepRibbon cover palette test
+name: Build SleepRibbon v1.1.0 profiles test
 
 on:
   push:
     branches:
-      - v1.1.0-menu-registration-test
+      - v1.1.0-profiles-test
   workflow_dispatch:
 
 permissions:
@@ -33,11 +33,11 @@ jobs:
           mkdir -p build/sleepribbon.koplugin
           cp _meta.lua main.lua sleepribbon_colorpicker.lua sleepribbon_i18n.lua LICENSE build/sleepribbon.koplugin/
           cd build
-          zip -r ../SleepRibbon-v1.1.0-menu-test.zip sleepribbon.koplugin
+          zip -r ../SleepRibbon-v1.1.0-profiles-test.zip sleepribbon.koplugin
 
       - name: Upload test build
         uses: actions/upload-artifact@v4
         with:
-          name: SleepRibbon-v1.1.0-menu-test
-          path: SleepRibbon-v1.1.0-menu-test.zip
+          name: SleepRibbon-v1.1.0-profiles-test
+          path: SleepRibbon-v1.1.0-profiles-test.zip
           if-no-files-found: error
