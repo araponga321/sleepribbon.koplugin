@@ -994,56 +994,120 @@ local function paletteLuminance(color)
     return 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b
 end
 
-local function extractCoverPalette(cover_bb)
-    if not cover_bb then return nil end
+local function paletteHSV(color)
+    local r, g, b = color.r / 255, color.g / 255, color.b / 255
+    local maxc = math.max(r, g, b)
+    local minc = math.min(r, g, b)
+    local delta = maxc - minc
+    local hue = 0
 
-    local width = tonumber(cover_bb:getWidth()) or 0
-    local height = tonumber(cover_bb:getHeight()) or 0
-    if width <= 0 or height <= 0 then return nil end
+    if delta > 0 then
+        if maxc == r then
+            hue = 60 * (((g - b) / delta) % 6)
+        elseif maxc == g then
+            hue = 60 * (((b - r) / delta) + 2)
+        else
+            hue = 60 * (((r - g) / delta) + 4)
+        end
+    end
+    if hue < 0 then hue = hue + 360 end
 
-    -- Sample only a few thousand pixels. This is enough for representative
-    -- colors and keeps extraction cheap even when the source cover is large.
-    local target_samples = 5000
-    local step = math.max(1, math.floor(math.sqrt((width * height) / target_samples)))
-    local bins = {}
+    local saturation = maxc == 0 and 0 or (delta / maxc)
+    return hue, saturation, maxc
+end
 
-    for y = 0, height - 1, step do
-        for x = 0, width - 1, step do
-            local pixel = cover_bb:getPixel(x, y)
-            if pixel and pixel.getColorRGB32 then
-                local rgb32 = pixel:getColorRGB32()
-                local red = tonumber(rgb32.r) or 0
-                local green = tonumber(rgb32.g) or 0
-                local blue = tonumber(rgb32.b) or 0
+local function paletteHueFamily(color)
+    local hue, saturation = paletteHSV(color)
+    if saturation < 0.16 then return 0 end -- neutral
 
-                -- 4-bit/channel quantization groups tiny variations together
-                -- before representative colors are selected.
-                local qr = math.floor(red / 16)
-                local qg = math.floor(green / 16)
-                local qb = math.floor(blue / 16)
-                local key = qr * 256 + qg * 16 + qb
-                local bin = bins[key]
-                if not bin then
-                    bin = { count = 0, r = 0, g = 0, b = 0 }
-                    bins[key] = bin
-                end
-                bin.count = bin.count + 1
-                bin.r = bin.r + red
-                bin.g = bin.g + green
-                bin.b = bin.b + blue
-            end
+    if hue < 15 or hue >= 345 then return 1 end -- red
+    if hue < 45 then return 2 end -- orange / brown
+    if hue < 75 then return 3 end -- yellow
+    if hue < 165 then return 4 end -- green
+    if hue < 200 then return 5 end -- cyan
+    if hue < 255 then return 6 end -- blue
+    if hue < 290 then return 7 end -- violet
+    return 8 -- magenta
+end
+
+local function paletteIsHueConcentrated(colors)
+    local x, y, weight_sum, chromatic = 0, 0, 0, 0
+    for color_index = 1, #colors do
+        local hue, saturation = paletteHSV(colors[color_index])
+        if saturation >= 0.18 then
+            local weight = 0.35 + saturation
+            local angle = math.rad(hue)
+            x = x + math.cos(angle) * weight
+            y = y + math.sin(angle) * weight
+            weight_sum = weight_sum + weight
+            chromatic = chromatic + 1
         end
     end
 
+    if chromatic <= 4 or weight_sum == 0 then return true end
+    local concentration = math.sqrt(x * x + y * y) / weight_sum
+    return concentration >= 0.82
+end
+
+local function sortCoverPalette(colors)
+    if paletteIsHueConcentrated(colors) then
+        -- Covers dominated by one hue family are most useful as a smooth
+        -- dark-to-light spectrum (e.g., sepia, red or blue covers).
+        table.sort(colors, function(a, b)
+            local la, lb = paletteLuminance(a), paletteLuminance(b)
+            if math.abs(la - lb) < 0.5 then
+                local _, sa = paletteHSV(a)
+                local _, sb = paletteHSV(b)
+                return sa > sb
+            end
+            return la < lb
+        end)
+        return
+    end
+
+    -- Multi-family covers are easier to scan when related hues stay together;
+    -- within each family, keep the dark-to-light progression.
+    table.sort(colors, function(a, b)
+        local fa, fb = paletteHueFamily(a), paletteHueFamily(b)
+        if fa ~= fb then return fa < fb end
+
+        local la, lb = paletteLuminance(a), paletteLuminance(b)
+        if math.abs(la - lb) >= 0.5 then return la < lb end
+
+        local ha, sa = paletteHSV(a)
+        local hb, sb = paletteHSV(b)
+        if math.abs(ha - hb) >= 0.5 then return ha < hb end
+        return sa > sb
+    end)
+end
+
+local function addPaletteBin(bins, color)
+    local qr = math.floor(color.r / 16)
+    local qg = math.floor(color.g / 16)
+    local qb = math.floor(color.b / 16)
+    local key = qr * 256 + qg * 16 + qb
+    local bin = bins[key]
+    if not bin then
+        bin = { count = 0, r = 0, g = 0, b = 0, key = key }
+        bins[key] = bin
+    end
+    bin.count = bin.count + 1
+    bin.r = bin.r + color.r
+    bin.g = bin.g + color.g
+    bin.b = bin.b + color.b
+end
+
+local function paletteCandidatesFromBins(bins)
     local candidates = {}
     for key, bin in pairs(bins) do
         if bin.count > 0 then
+            local color = paletteRGB(
+                bin.r / bin.count,
+                bin.g / bin.count,
+                bin.b / bin.count
+            )
             table.insert(candidates, {
-                color = paletteRGB(
-                    bin.r / bin.count,
-                    bin.g / bin.count,
-                    bin.b / bin.count
-                ),
+                color = color,
                 count = bin.count,
                 key = key,
             })
@@ -1053,42 +1117,153 @@ local function extractCoverPalette(cover_bb)
         if a.count == b.count then return a.key < b.key end
         return a.count > b.count
     end)
+    return candidates
+end
 
-    local selected = {}
-    local function addWithMinimumDistance(minimum_distance)
-        for candidate_index = 1, #candidates do
-            if #selected >= 25 then return end
-            local candidate = candidates[candidate_index].color
-            local distinct = true
-            for selected_index = 1, #selected do
-                if paletteDistance(candidate, selected[selected_index]) <= minimum_distance then
-                    distinct = false
-                    break
+local function averagedCoverBins(cover_bb, width, height)
+    -- Build a small spatial representation of the cover. Each grid cell is
+    -- averaged from several points, so brush strokes, paper texture and image
+    -- noise lose influence while the cover's large color masses remain.
+    local target_blocks = 1200
+    local grid_cols = math.max(1, math.floor(math.sqrt(target_blocks * width / height) + 0.5))
+    local grid_rows = math.max(1, math.floor(target_blocks / grid_cols + 0.5))
+    local samples_per_axis = 4
+    local bins = {}
+
+    for row = 0, grid_rows - 1 do
+        local y0 = math.floor(row * height / grid_rows)
+        local y1 = math.max(y0, math.floor((row + 1) * height / grid_rows) - 1)
+        for col = 0, grid_cols - 1 do
+            local x0 = math.floor(col * width / grid_cols)
+            local x1 = math.max(x0, math.floor((col + 1) * width / grid_cols) - 1)
+            local red, green, blue, samples = 0, 0, 0, 0
+
+            for sample_y = 0, samples_per_axis - 1 do
+                local py
+                if samples_per_axis == 1 or y1 == y0 then
+                    py = y0
+                else
+                    py = math.floor(y0 + (y1 - y0) * sample_y / (samples_per_axis - 1) + 0.5)
+                end
+                for sample_x = 0, samples_per_axis - 1 do
+                    local px
+                    if samples_per_axis == 1 or x1 == x0 then
+                        px = x0
+                    else
+                        px = math.floor(x0 + (x1 - x0) * sample_x / (samples_per_axis - 1) + 0.5)
+                    end
+
+                    local pixel = cover_bb:getPixel(px, py)
+                    if pixel and pixel.getColorRGB32 then
+                        local rgb32 = pixel:getColorRGB32()
+                        red = red + (tonumber(rgb32.r) or 0)
+                        green = green + (tonumber(rgb32.g) or 0)
+                        blue = blue + (tonumber(rgb32.b) or 0)
+                        samples = samples + 1
+                    end
                 end
             end
-            if distinct then
+
+            if samples > 0 then
+                addPaletteBin(bins, paletteRGB(
+                    red / samples,
+                    green / samples,
+                    blue / samples
+                ))
+            end
+        end
+    end
+    return bins
+end
+
+local function accentCoverBins(cover_bb, width, height)
+    -- A second, sparse pass over raw pixels preserves small but unmistakable
+    -- accents (logos, lettering, isolated graphic elements). These colors may
+    -- enter the palette, but only a couple of slots are reserved for them.
+    local target_samples = 4200
+    local step = math.max(1, math.floor(math.sqrt((width * height) / target_samples)))
+    local bins = {}
+    local total = 0
+
+    for y = 0, height - 1, step do
+        for x = 0, width - 1, step do
+            local pixel = cover_bb:getPixel(x, y)
+            if pixel and pixel.getColorRGB32 then
+                local rgb32 = pixel:getColorRGB32()
+                local color = paletteRGB(rgb32.r, rgb32.g, rgb32.b)
+                local _, saturation, value = paletteHSV(color)
+                if saturation >= 0.52 and value >= 0.18 then
+                    addPaletteBin(bins, color)
+                end
+                total = total + 1
+            end
+        end
+    end
+    return bins, total
+end
+
+local function extractCoverPalette(cover_bb)
+    if not cover_bb then return nil end
+
+    local width = tonumber(cover_bb:getWidth()) or 0
+    local height = tonumber(cover_bb:getHeight()) or 0
+    if width <= 0 or height <= 0 then return nil end
+
+    local dominant_candidates = paletteCandidatesFromBins(
+        averagedCoverBins(cover_bb, width, height)
+    )
+    if #dominant_candidates == 0 then return nil end
+
+    local selected = {}
+    local function isDistinct(candidate, minimum_distance)
+        for selected_index = 1, #selected do
+            if paletteDistance(candidate, selected[selected_index]) <= minimum_distance then
+                return false
+            end
+        end
+        return true
+    end
+
+    local function addDominantColors(limit, minimum_distance)
+        for candidate_index = 1, #dominant_candidates do
+            if #selected >= limit then return end
+            local candidate = dominant_candidates[candidate_index].color
+            if isDistinct(candidate, minimum_distance) then
                 table.insert(selected, candidate)
             end
         end
     end
 
-    -- Start with strongly distinct colors, then progressively relax the
-    -- threshold so detailed/near-monochrome covers can still fill the grid.
-    addWithMinimumDistance(72)
-    addWithMinimumDistance(52)
-    addWithMinimumDistance(36)
-    addWithMinimumDistance(22)
-    addWithMinimumDistance(0)
+    -- Let dominant cover masses define most of the palette. Relaxing the
+    -- distance in stages retains a useful spectrum on covers with few colors.
+    addDominantColors(23, 72)
+    addDominantColors(23, 52)
+    addDominantColors(23, 36)
+    addDominantColors(23, 22)
 
-    table.sort(selected, function(a, b)
-        local la, lb = paletteLuminance(a), paletteLuminance(b)
-        if math.abs(la - lb) < 0.5 then
-            if a.r ~= b.r then return a.r < b.r end
-            if a.g ~= b.g then return a.g < b.g end
-            return a.b < b.b
+    local accent_bins, raw_sample_count = accentCoverBins(cover_bb, width, height)
+    local accent_candidates = paletteCandidatesFromBins(accent_bins)
+    local minimum_accent_count = math.max(3, math.floor(raw_sample_count * 0.0015 + 0.5))
+    local accents_added = 0
+
+    for candidate_index = 1, #accent_candidates do
+        if accents_added >= 2 or #selected >= 25 then break end
+        local entry = accent_candidates[candidate_index]
+        if entry.count >= minimum_accent_count
+            and isDistinct(entry.color, 58)
+        then
+            table.insert(selected, entry.color)
+            accents_added = accents_added + 1
         end
-        return la < lb
-    end)
+    end
+
+    -- If the cover did not need accent slots, fill the grid with finer shades
+    -- from its dominant families rather than inventing unrelated variety.
+    addDominantColors(25, 16)
+    addDominantColors(25, 8)
+    addDominantColors(25, 0)
+
+    sortCoverPalette(selected)
 
     local palette = {}
     for color_index = 1, math.min(25, #selected) do
@@ -1103,6 +1278,8 @@ function SleepRibbon:getPaletteBookFile()
         or G_reader_settings:readSetting("lastfile")
 end
 
+local COVER_PALETTE_CACHE_VERSION = 2
+
 function SleepRibbon:getCoverPaletteCache()
     local cache = self.settings:readSetting("cover_palette_cache")
     return type(cache) == "table" and cache or {}
@@ -1116,8 +1293,13 @@ function SleepRibbon:getCoverPalette(force_refresh)
 
     local cache = self:getCoverPaletteCache()
     local cached = cache[file]
-    if not force_refresh and type(cached) == "table" and #cached > 0 then
-        return cached
+    if not force_refresh
+        and type(cached) == "table"
+        and cached.version == COVER_PALETTE_CACHE_VERSION
+        and type(cached.colors) == "table"
+        and #cached.colors > 0
+    then
+        return cached.colors
     end
 
     local bookinfo = self.ui and self.ui.bookinfo
@@ -1146,7 +1328,10 @@ function SleepRibbon:getCoverPalette(force_refresh)
         return nil, _("Could not extract colors from the cover.")
     end
 
-    cache[file] = palette
+    cache[file] = {
+        version = COVER_PALETTE_CACHE_VERSION,
+        colors = palette,
+    }
     self.settings:saveSetting("cover_palette_cache", cache):flush()
     return palette
 end
