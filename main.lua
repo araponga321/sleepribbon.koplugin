@@ -1692,7 +1692,8 @@ function SleepRibbon:addToMainMenu(menu_items)
     local screensaver = menu_items and menu_items.screensaver
     local items = screensaver and screensaver.sub_item_table
     if type(items) ~= "table" then
-        logger.warn("SleepRibbon: native screensaver menu is unavailable")
+        -- Expected on devices without sleep-screen support and in KOReader's
+        -- debug registration probe, which deliberately passes an empty table.
         return
     end
 
