@@ -1061,7 +1061,7 @@ local function extractCoverPalette(cover_bb)
             local candidate = candidates[candidate_index].color
             local distinct = true
             for selected_index = 1, #selected do
-                if paletteDistance(candidate, selected[selected_index]) < minimum_distance then
+                if paletteDistance(candidate, selected[selected_index]) <= minimum_distance then
                     distinct = false
                     break
                 end
