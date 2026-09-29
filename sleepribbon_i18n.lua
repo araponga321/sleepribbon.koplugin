@@ -50,6 +50,15 @@ local PT = {
     ["Default"] = "Padrão",
     ["Apply"] = "Aplicar",
     ["Invalid color. Enter six hexadecimal digits (RRGGBB)."] = "Cor inválida. Digite seis dígitos hexadecimais (RRGGBB).",
+    ["Palette"] = "Paleta",
+    ["Standard"] = "Padrão",
+    ["Cover"] = "Capa",
+    ["Cover palette unavailable."] = "Paleta da capa indisponível.",
+    ["Refresh cover palette"] = "Atualizar paleta da capa",
+    ["Cover palette refreshed"] = "Paleta da capa atualizada",
+    ["No book is available for a cover palette."] = "Nenhum livro está disponível para gerar a paleta da capa.",
+    ["No cover image is available for this book."] = "Nenhuma imagem de capa está disponível para este livro.",
+    ["Could not extract colors from the cover."] = "Não foi possível extrair cores da capa.",
 }
 
 local ES = {
@@ -98,6 +107,15 @@ local ES = {
     ["Default"] = "Predeterminado",
     ["Apply"] = "Aplicar",
     ["Invalid color. Enter six hexadecimal digits (RRGGBB)."] = "Color no válido. Introduce seis dígitos hexadecimales (RRGGBB).",
+    ["Palette"] = "Paleta",
+    ["Standard"] = "Estándar",
+    ["Cover"] = "Portada",
+    ["Cover palette unavailable."] = "La paleta de la portada no está disponible.",
+    ["Refresh cover palette"] = "Actualizar paleta de la portada",
+    ["Cover palette refreshed"] = "Paleta de la portada actualizada",
+    ["No book is available for a cover palette."] = "No hay ningún libro disponible para generar una paleta de portada.",
+    ["No cover image is available for this book."] = "No hay una imagen de portada disponible para este libro.",
+    ["Could not extract colors from the cover."] = "No se pudieron extraer colores de la portada.",
 }
 
 local function languageFamily()
