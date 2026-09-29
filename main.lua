@@ -1569,7 +1569,7 @@ function SleepRibbon:buildAutoColorMenu()
             end,
             sub_item_table_func = function()
                 local layouts = {}
-                for _, layout_entry in ipairs(AUTO_LAYOUTS) do
+                for layout_index, layout_entry in ipairs(AUTO_LAYOUTS) do
                     local layout = layout_entry
                     table.insert(layouts, {
                         text = _(layout.label),
