@@ -1980,7 +1980,7 @@ function SleepRibbon:getMenuItem()
                         text_func = function()
                             local mode = self:read("progress_show_remainder")
                                 and _("Completed + remaining") or _("Completed only")
-                            return _("Progress display") .. ": " .. mode
+                            return _("Style") .. ": " .. mode
                         end,
                         enabled_func = function() return self:read("progress_enabled") and true or false end,
                         sub_item_table = {
