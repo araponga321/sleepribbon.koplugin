@@ -1016,10 +1016,18 @@ local function paletteHSV(color)
     return hue, saturation, maxc
 end
 
-local function paletteHueFamily(color)
-    local hue, saturation = paletteHSV(color)
-    if saturation < 0.16 then return 0 end -- neutral
+local function paletteSpectrumGroup(color)
+    local hue, saturation, value = paletteHSV(color)
+    local luminance = paletteLuminance(color)
 
+    -- At the dark extreme, perceived blackness matters more than computed hue.
+    if luminance <= 34 or value <= 0.15 then return 0 end
+
+    -- Low-saturation colors are kept together at the end, where they can move
+    -- naturally from gray through off-white to white.
+    if saturation < 0.16 then return 9 end
+
+    -- Fixed, predictable spectrum order.
     if hue < 15 or hue >= 345 then return 1 end -- red
     if hue < 45 then return 2 end -- orange / brown
     if hue < 75 then return 3 end -- yellow
@@ -1030,46 +1038,10 @@ local function paletteHueFamily(color)
     return 8 -- magenta
 end
 
-local function paletteIsHueConcentrated(colors)
-    local x, y, weight_sum, chromatic = 0, 0, 0, 0
-    for color_index = 1, #colors do
-        local hue, saturation = paletteHSV(colors[color_index])
-        if saturation >= 0.18 then
-            local weight = 0.35 + saturation
-            local angle = math.rad(hue)
-            x = x + math.cos(angle) * weight
-            y = y + math.sin(angle) * weight
-            weight_sum = weight_sum + weight
-            chromatic = chromatic + 1
-        end
-    end
-
-    if chromatic <= 4 or weight_sum == 0 then return true end
-    local concentration = math.sqrt(x * x + y * y) / weight_sum
-    return concentration >= 0.82
-end
-
 local function sortCoverPalette(colors)
-    if paletteIsHueConcentrated(colors) then
-        -- Covers dominated by one hue family are most useful as a smooth
-        -- dark-to-light spectrum (e.g., sepia, red or blue covers).
-        table.sort(colors, function(a, b)
-            local la, lb = paletteLuminance(a), paletteLuminance(b)
-            if math.abs(la - lb) < 0.5 then
-                local _, sa = paletteHSV(a)
-                local _, sb = paletteHSV(b)
-                return sa > sb
-            end
-            return la < lb
-        end)
-        return
-    end
-
-    -- Multi-family covers are easier to scan when related hues stay together;
-    -- within each family, keep the dark-to-light progression.
     table.sort(colors, function(a, b)
-        local fa, fb = paletteHueFamily(a), paletteHueFamily(b)
-        if fa ~= fb then return fa < fb end
+        local ga, gb = paletteSpectrumGroup(a), paletteSpectrumGroup(b)
+        if ga ~= gb then return ga < gb end
 
         local la, lb = paletteLuminance(a), paletteLuminance(b)
         if math.abs(la - lb) >= 0.5 then return la < lb end
@@ -1202,6 +1174,26 @@ local function accentCoverBins(cover_bb, width, height)
     return bins, total
 end
 
+local function rawCoverBins(cover_bb, width, height)
+    -- Used only as a fallback when spatial averaging leaves fewer than 25
+    -- useful candidates. This restores fine shades on genuinely narrow
+    -- palettes without affecting complex covers that already fill the grid.
+    local target_samples = 6500
+    local step = math.max(1, math.floor(math.sqrt((width * height) / target_samples)))
+    local bins = {}
+
+    for y = 0, height - 1, step do
+        for x = 0, width - 1, step do
+            local pixel = cover_bb:getPixel(x, y)
+            if pixel and pixel.getColorRGB32 then
+                local rgb32 = pixel:getColorRGB32()
+                addPaletteBin(bins, paletteRGB(rgb32.r, rgb32.g, rgb32.b))
+            end
+        end
+    end
+    return bins
+end
+
 local function extractCoverPalette(cover_bb)
     if not cover_bb then return nil end
 
@@ -1263,6 +1255,25 @@ local function extractCoverPalette(cover_bb)
     addDominantColors(25, 8)
     addDominantColors(25, 0)
 
+    if #selected < 25 then
+        local raw_candidates = paletteCandidatesFromBins(
+            rawCoverBins(cover_bb, width, height)
+        )
+        local function addRawColors(minimum_distance)
+            for candidate_index = 1, #raw_candidates do
+                if #selected >= 25 then return end
+                local candidate = raw_candidates[candidate_index].color
+                if isDistinct(candidate, minimum_distance) then
+                    table.insert(selected, candidate)
+                end
+            end
+        end
+        addRawColors(18)
+        addRawColors(10)
+        addRawColors(4)
+        addRawColors(0)
+    end
+
     sortCoverPalette(selected)
 
     local palette = {}
@@ -1278,7 +1289,7 @@ function SleepRibbon:getPaletteBookFile()
         or G_reader_settings:readSetting("lastfile")
 end
 
-local COVER_PALETTE_CACHE_VERSION = 2
+local COVER_PALETTE_CACHE_VERSION = 3
 
 function SleepRibbon:getCoverPaletteCache()
     local cache = self.settings:readSetting("cover_palette_cache")
