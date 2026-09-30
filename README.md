@@ -8,7 +8,7 @@ Rather than placing a large information panel over the cover, SleepRibbon styles
 
 ![SleepRibbon default appearance](assets/sleep-screen-default.png)
 
-![SleepRibbon menu demo](assets/sleepribbon-menu-demo.webp)
+![SleepRibbon menu demo](assets/sleepribbon-menu-demo-v1.1.0.webp)
 
 ## Features
 
