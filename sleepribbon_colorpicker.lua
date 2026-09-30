@@ -27,12 +27,14 @@ local _ = require("sleepribbon_i18n").gettext
 
 local M = {}
 
-local PALETTE = {
-    { "#000000", "#404040", "#808080", "#BFBFBF", "#FFFFFF" },
-    { "#C00000", "#FF6600", "#8B4513", "#B8860B", "#8B0000" },
-    { "#FF69B4", "#FFA07A", "#DEB887", "#FFD700", "#FF8C69" },
-    { "#0000CD", "#228B22", "#008B8B", "#8B008B", "#2F4F4F" },
-    { "#87CEEB", "#98FB98", "#DDA0DD", "#B0E0E6", "#FFB6C1" },
+local STANDARD_PALETTE = {
+    -- Fixed spectrum order: black -> red -> orange -> yellow -> green ->
+    -- cyan -> blue -> violet -> magenta -> neutrals -> white.
+    { "#000000", "#8B0000", "#C00000", "#8B4513", "#FF6600" },
+    { "#FF8C69", "#FFA07A", "#DEB887", "#B8860B", "#FFD700" },
+    { "#228B22", "#98FB98", "#2F4F4F", "#008B8B", "#87CEEB" },
+    { "#B0E0E6", "#0000CD", "#8B008B", "#DDA0DD", "#FF69B4" },
+    { "#FFB6C1", "#404040", "#808080", "#BFBFBF", "#FFFFFF" },
 }
 
 local function normalizeHex(value)
@@ -126,12 +128,44 @@ local function footerButton(label, width, height, callback)
     return button
 end
 
+local function paletteModeButton(label, selected, width, height, callback)
+    local text = TextWidget:new{
+        text = (selected and "● " or "○ ") .. label,
+        face = Font:getFace("cfont", 17),
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+    local frame = FrameContainer:new{
+        background = selected and Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_WHITE,
+        bordersize = Size.border.thin,
+        padding = 0,
+        CenterContainer:new{
+            dimen = Geom:new{ w = width, h = height },
+            text,
+        },
+    }
+    local button = InputContainer:new{
+        dimen = Geom:new{ w = width, h = height },
+        frame,
+    }
+    button.ges_events = {
+        TapSelect = { GestureRange:new{ ges = "tap", range = button.dimen } },
+    }
+    function button:onTapSelect()
+        callback()
+        return true
+    end
+    return button
+end
+
 local ColorPicker = FocusManager:extend{
     is_always_active = true,
     title = nil,
     selected_hex = "#FFFFFF",
     default_hex = "#FFFFFF",
     apply_callback = nil,
+    cover_palette_provider = nil,
+    cover_palette = nil,
+    palette_mode = "cover",
 }
 
 function ColorPicker:init()
@@ -141,6 +175,21 @@ function ColorPicker:init()
     self.swatch_gap = Screen:scaleBySize(8)
     self.selected_hex = normalizeHex(self.selected_hex) or "#FFFFFF"
     self.default_hex = normalizeHex(self.default_hex) or "#FFFFFF"
+
+    -- Cover is the default palette. Load it lazily when the picker is opened;
+    -- if no book/cover is available, fall back silently to Standard.
+    self.palette_mode = "cover"
+    if self.cover_palette_provider then
+        local palette = self.cover_palette_provider()
+        if type(palette) == "table" and #palette > 0 then
+            self.cover_palette = palette
+        else
+            self.palette_mode = "standard"
+        end
+    else
+        self.palette_mode = "standard"
+    end
+
     self:update()
 end
 
@@ -154,6 +203,55 @@ function ColorPicker:_closeKeyboard()
     if self:_keyboardVisible() and self.hex_input.onCloseKeyboard then
         self.hex_input:onCloseKeyboard()
     end
+end
+
+function ColorPicker:_coverPaletteAsRows()
+    if type(self.cover_palette) ~= "table" or #self.cover_palette == 0 then
+        return nil
+    end
+    local rows = {}
+    for color_index = 1, #self.cover_palette do
+        local row_index = math.floor((color_index - 1) / 5) + 1
+        rows[row_index] = rows[row_index] or {}
+        table.insert(rows[row_index], self.cover_palette[color_index])
+    end
+    return rows
+end
+
+function ColorPicker:_activePalette()
+    if self.palette_mode == "cover" then
+        return self:_coverPaletteAsRows() or STANDARD_PALETTE
+    end
+    return STANDARD_PALETTE
+end
+
+function ColorPicker:_setPaletteMode(mode)
+    if mode == "standard" then
+        self.palette_mode = "standard"
+        self:_closeKeyboard()
+        self:update()
+        return
+    end
+
+    if mode ~= "cover" then return end
+    if type(self.cover_palette) ~= "table" or #self.cover_palette == 0 then
+        if not self.cover_palette_provider then
+            UIManager:show(InfoMessage:new{ text = _("Cover palette unavailable.") })
+            return
+        end
+        local palette, err = self.cover_palette_provider()
+        if type(palette) ~= "table" or #palette == 0 then
+            UIManager:show(InfoMessage:new{
+                text = err or _("Cover palette unavailable."),
+            })
+            return
+        end
+        self.cover_palette = palette
+    end
+
+    self.palette_mode = "cover"
+    self:_closeKeyboard()
+    self:update()
 end
 
 function ColorPicker:onCloseWidget()
@@ -202,7 +300,8 @@ function ColorPicker:update()
     local dialog_w = inner_w + 2 * Size.border.window
 
     local palette = VerticalGroup:new{ align = "center" }
-    for row_index, row in ipairs(PALETTE) do
+    local active_palette = self:_activePalette()
+    for row_index, row in ipairs(active_palette) do
         if row_index > 1 then
             palette[#palette + 1] = VerticalSpan:new{ width = gap }
         end
@@ -256,6 +355,33 @@ function ColorPicker:update()
         self.preview_swatch,
     }
 
+    local selector_h = Screen:scaleBySize(42)
+    local selector_button_w = Screen:scaleBySize(112)
+    local palette_selector = HorizontalGroup:new{
+        align = "center",
+        TextWidget:new{
+            text = _("Palette"),
+            face = Font:getFace("cfont", 17),
+            fgcolor = Blitbuffer.COLOR_BLACK,
+        },
+        HorizontalSpan:new{ width = Size.padding.large },
+        paletteModeButton(
+            _("Cover"),
+            self.palette_mode == "cover",
+            selector_button_w,
+            selector_h,
+            function() self:_setPaletteMode("cover") end
+        ),
+        HorizontalSpan:new{ width = Size.padding.small },
+        paletteModeButton(
+            _("Standard"),
+            self.palette_mode == "standard",
+            selector_button_w,
+            selector_h,
+            function() self:_setPaletteMode("standard") end
+        ),
+    }
+
     local footer_h = Screen:scaleBySize(46)
     local btn_w = math.floor(inner_w / 3)
     local cancel = footerButton(_("Cancel"), btn_w, footer_h, function()
@@ -292,7 +418,9 @@ function ColorPicker:update()
         title_bar,
         VerticalSpan:new{ width = Size.padding.large },
         hex_row,
-        VerticalSpan:new{ width = Size.padding.fullscreen },
+        VerticalSpan:new{ width = Size.padding.large },
+        palette_selector,
+        VerticalSpan:new{ width = Size.padding.large },
         palette,
         VerticalSpan:new{ width = Size.padding.fullscreen },
         LineWidget:new{
@@ -323,6 +451,7 @@ function M.show(args)
         title = args.title or _("Pick a color"),
         selected_hex = args.value,
         default_hex = args.default_value,
+        cover_palette_provider = args.cover_palette_provider,
         apply_callback = args.callback,
     })
 end

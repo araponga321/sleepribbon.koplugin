@@ -2,14 +2,15 @@
 -- Configurable styling for KOReader's native sleep-screen "Banner" message.
 --
 -- Principles:
---   * KOReader remains responsible for the cover, message tokens, opacity and position.
---   * SleepRibbon only replaces the visual Banner widget.
+--   * KOReader remains responsible for the cover and message-token expansion.
+--   * SleepRibbon styles the Banner and can apply scoped message/position/opacity overrides.
 --   * No polling, timers or background work.
 --   * The progress bar is a separate strip outside the ribbon body.
 
 local Blitbuffer = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local ConfirmBox = require("ui/widget/confirmbox")
+local CustomPositionContainer = require("ui/widget/container/custompositioncontainer")
 local DataStorage = require("datastorage")
 local datetime = require("datetime")
 local Device = require("device")
@@ -25,10 +26,6 @@ local InputContainer = require("ui/widget/container/inputcontainer")
 local LuaSettings = require("luasettings")
 local Notification = require("ui/widget/notification")
 local RenderText = require("ui/rendertext")
-local ReaderMenu = require("apps/reader/modules/readermenu")
-local FileManagerMenu = require("apps/filemanager/filemanagermenu")
-local ReaderMenuOrder = require("ui/elements/reader_menu_order")
-local FileManagerMenuOrder = require("ui/elements/filemanager_menu_order")
 local Screen = Device.screen
 local Size = require("ui/size")
 local SpinWidget = require("ui/widget/spinwidget")
@@ -46,6 +43,12 @@ local KO_ = require("gettext")
 local _ = require("sleepribbon_i18n").gettext
 
 local SETTINGS_PATH = DataStorage:getSettingsDir() .. "/sleepribbon.lua"
+
+local BOOK_PROFILE_KEY = "sleepribbon_profile"
+local BOOK_PROFILE_ENABLED_KEY = "sleepribbon_profile_enabled"
+local BOOK_MESSAGE_KEY = "sleep_message"
+local BOOK_POSITION_KEY = "message_position"
+local BOOK_OPACITY_KEY = "message_opacity"
 
 local DEFAULTS = {
     enabled = true,
@@ -315,11 +318,13 @@ local SleepRibbon = WidgetContainer:extend{
 
 local active_instance
 local original_textbox_new
+local original_customposition_new
 local original_expand_string
+local original_screensaver_show
 local patch_installed = false
+local position_opacity_hook_installed = false
 local expand_hook_installed = false
-local menu_hooks_installed = false
-local menu_instances = setmetatable({}, { __mode = "k" })
+local screensaver_profile_hook_installed = false
 
 function SleepRibbon:initDefaults()
     local changed = false
@@ -336,31 +341,211 @@ function SleepRibbon:init()
     self:initDefaults()
     active_instance = self
     self:installBannerHook()
+    self:installPositionOpacityHook()
     self:installExpandStringHook()
-    self:installMenuHooks()
+    self:installScreensaverProfileHook()
 
+    -- Register as a normal Settings item, matching KOReader's plugin lifecycle.
+    -- Invalidating the cached table makes late plugin registration deterministic
+    -- on devices where the menu may already have been built.
     if self.ui and self.ui.menu then
-        menu_instances[self.ui.menu] = self
-        -- Keep normal plugin registration/lifecycle, but menu placement itself
-        -- happens after KOReader has built the real menu tree.
         self.ui.menu:registerToMainMenu(self)
-        -- Force a rebuild on the next menu opening so the post-build hook runs.
         self.ui.menu.tab_item_table = nil
     end
+end
+
+function SleepRibbon:getCurrentBookFile()
+    local ui = self.ui
+    if ui and ui.document and ui.document.file then
+        return ui.document.file
+    end
+    return G_reader_settings:readSetting("lastfile")
+end
+
+function SleepRibbon:getCurrentDocSettings()
+    local ui = self.ui
+    if ui and ui.document and ui.doc_settings then
+        return ui.doc_settings
+    end
+
+    -- In File Manager there is no open document, but KOReader's sleep screen
+    -- still refers to lastfile. Use that book's sidecar so "Current book"
+    -- remains useful there too.
+    local file = self:getCurrentBookFile()
+    if not file then return nil end
+
+    if self._profile_doc_settings_file == file and self._profile_doc_settings then
+        return self._profile_doc_settings
+    end
+
+    local BookList = require("ui/widget/booklist")
+    if not BookList.hasBookBeenOpened(file) then return nil end
+
+    local doc_settings = BookList.getDocSettings(file)
+    if not doc_settings then return nil end
+
+    self._profile_doc_settings_file = file
+    self._profile_doc_settings = doc_settings
+    return doc_settings
+end
+
+function SleepRibbon:hasCurrentBook()
+    return self:getCurrentDocSettings() ~= nil
+end
+
+function SleepRibbon:isCurrentBookProfileEnabled()
+    local doc_settings = self:getCurrentDocSettings()
+    return doc_settings and doc_settings:isTrue(BOOK_PROFILE_ENABLED_KEY) or false
+end
+
+function SleepRibbon:setCurrentBookProfileEnabled(enabled)
+    local doc_settings = self:getCurrentDocSettings()
+    if not doc_settings then return false end
+    if enabled then
+        doc_settings:makeTrue(BOOK_PROFILE_ENABLED_KEY)
+    else
+        doc_settings:makeFalse(BOOK_PROFILE_ENABLED_KEY)
+    end
+    doc_settings:flush()
+    return true
+end
+
+function SleepRibbon:getCurrentBookProfile()
+    local doc_settings = self:getCurrentDocSettings()
+    if not doc_settings then return nil end
+    local profile = doc_settings:readSetting(BOOK_PROFILE_KEY)
+    return type(profile) == "table" and profile or {}
+end
+
+function SleepRibbon:saveCurrentBookProfile(profile)
+    local doc_settings = self:getCurrentDocSettings()
+    if not doc_settings then return false end
+    doc_settings:saveSetting(BOOK_PROFILE_KEY, profile or {})
+    doc_settings:flush()
+    return true
+end
+
+function SleepRibbon:resetCurrentBookProfile()
+    local doc_settings = self:getCurrentDocSettings()
+    if not doc_settings then return false end
+    doc_settings:delSetting(BOOK_PROFILE_KEY)
+    doc_settings:flush()
+    return true
 end
 
 function SleepRibbon:isEnabled()
     return self.settings:nilOrTrue("enabled")
 end
 
-function SleepRibbon:read(key)
+function SleepRibbon:readGlobal(key)
     local value = self.settings:readSetting(key)
     if value == nil then return DEFAULTS[key] end
     return value
 end
 
-function SleepRibbon:save(key, value)
+function SleepRibbon:saveGlobal(key, value)
     self.settings:saveSetting(key, value):flush()
+end
+
+function SleepRibbon:read(key)
+    -- Enabled is the master plugin switch and is always global.
+    if key ~= "enabled" and self:isCurrentBookProfileEnabled() then
+        local profile = self:getCurrentBookProfile()
+        if profile and profile[key] ~= nil then
+            return profile[key]
+        end
+    end
+    return self:readGlobal(key)
+end
+
+function SleepRibbon:save(key, value)
+    if key ~= "enabled" and self:isCurrentBookProfileEnabled() then
+        local profile = self:getCurrentBookProfile() or {}
+        profile[key] = value
+        self:saveCurrentBookProfile(profile)
+        return
+    end
+    self:saveGlobal(key, value)
+end
+
+function SleepRibbon:getDefaultSleepMessage()
+    local Screensaver = require("ui/screensaver")
+    return Screensaver.default_screensaver_message
+end
+
+function SleepRibbon:getScopedMessage()
+    if self:isCurrentBookProfileEnabled() then
+        local profile = self:getCurrentBookProfile()
+        if profile and profile[BOOK_MESSAGE_KEY] ~= nil then
+            if profile[BOOK_MESSAGE_KEY] == false then
+                return self:getDefaultSleepMessage()
+            end
+            return profile[BOOK_MESSAGE_KEY]
+        end
+    end
+    return G_reader_settings:readSetting("screensaver_message") or self:getDefaultSleepMessage()
+end
+
+function SleepRibbon:saveScopedMessage(value)
+    value = type(value) == "string" and value or nil
+    if value == "" then value = nil end
+
+    if self:isCurrentBookProfileEnabled() then
+        local profile = self:getCurrentBookProfile() or {}
+        -- false is a deliberate per-book "use KOReader default message" value,
+        -- distinct from nil, which means inherit the global message.
+        profile[BOOK_MESSAGE_KEY] = value or false
+        self:saveCurrentBookProfile(profile)
+        return
+    end
+
+    if value then
+        G_reader_settings:saveSetting("screensaver_message", value)
+    else
+        G_reader_settings:delSetting("screensaver_message")
+    end
+end
+
+function SleepRibbon:getScopedMessagePosition()
+    if self:isCurrentBookProfileEnabled() then
+        local profile = self:getCurrentBookProfile()
+        if profile and profile[BOOK_POSITION_KEY] ~= nil then
+            return tonumber(profile[BOOK_POSITION_KEY]) or 50
+        end
+    end
+    return tonumber(G_reader_settings:readSetting("screensaver_message_vertical_position", 50)) or 50
+end
+
+function SleepRibbon:saveScopedMessagePosition(value)
+    value = tonumber(value) or 50
+    if self:isCurrentBookProfileEnabled() then
+        local profile = self:getCurrentBookProfile() or {}
+        profile[BOOK_POSITION_KEY] = value
+        self:saveCurrentBookProfile(profile)
+    else
+        G_reader_settings:saveSetting("screensaver_message_vertical_position", value)
+    end
+end
+
+function SleepRibbon:getScopedMessageOpacity()
+    if self:isCurrentBookProfileEnabled() then
+        local profile = self:getCurrentBookProfile()
+        if profile and profile[BOOK_OPACITY_KEY] ~= nil then
+            return tonumber(profile[BOOK_OPACITY_KEY]) or 100
+        end
+    end
+    return tonumber(G_reader_settings:readSetting("screensaver_message_alpha", 100)) or 100
+end
+
+function SleepRibbon:saveScopedMessageOpacity(value)
+    value = tonumber(value) or 100
+    if self:isCurrentBookProfileEnabled() then
+        local profile = self:getCurrentBookProfile() or {}
+        profile[BOOK_OPACITY_KEY] = value
+        self:saveCurrentBookProfile(profile)
+    else
+        G_reader_settings:saveSetting("screensaver_message_alpha", value)
+    end
 end
 
 function SleepRibbon:resetDefaults()
@@ -368,6 +553,12 @@ function SleepRibbon:resetDefaults()
         self.settings:saveSetting(key, value)
     end
     self.settings:flush()
+
+    -- Message controls are native KOReader settings in the global profile.
+    G_reader_settings:delSetting("screensaver_message")
+    G_reader_settings:saveSetting("screensaver_message_vertical_position", 50)
+    G_reader_settings:saveSetting("screensaver_message_alpha", 100)
+    if G_reader_settings.flush then G_reader_settings:flush() end
 end
 
 function SleepRibbon:getUIFontFace(size)
@@ -490,6 +681,70 @@ function SleepRibbon:installExpandStringHook()
     expand_hook_installed = true
 end
 
+function SleepRibbon:installScreensaverProfileHook()
+    if screensaver_profile_hook_installed then return end
+
+    local Screensaver = require("ui/screensaver")
+    original_screensaver_show = Screensaver.show
+
+    -- KOReader reads and expands screensaver_message in Screensaver.show(),
+    -- not in setup(). Keep the per-book override active only for the synchronous
+    -- construction of the sleep-screen widget, then restore the global value.
+    Screensaver.show = function(screensaver, ...)
+        local instance = active_instance
+        if not (instance and instance:isEnabled() and instance:isCurrentBookProfileEnabled()) then
+            return original_screensaver_show(screensaver, ...)
+        end
+
+        local profile = instance:getCurrentBookProfile()
+        if type(profile) ~= "table" then
+            return original_screensaver_show(screensaver, ...)
+        end
+
+        local saved = {}
+        local function override(setting, value)
+            if value == nil then return end
+            saved[#saved + 1] = {
+                setting = setting,
+                had_value = G_reader_settings:has(setting),
+                value = G_reader_settings:readSetting(setting),
+            }
+            G_reader_settings:saveSetting(setting, value)
+        end
+
+        if profile[BOOK_MESSAGE_KEY] ~= nil then
+            local message = profile[BOOK_MESSAGE_KEY]
+            if message == false then
+                message = screensaver.default_screensaver_message
+            end
+            override("screensaver_message", message)
+        end
+
+        if #saved == 0 then
+            return original_screensaver_show(screensaver, ...)
+        end
+
+        local args = { ... }
+        local results = { pcall(original_screensaver_show, screensaver, unpack(args)) }
+
+        for i = #saved, 1, -1 do
+            local entry = saved[i]
+            if entry.had_value then
+                G_reader_settings:saveSetting(entry.setting, entry.value)
+            else
+                G_reader_settings:delSetting(entry.setting)
+            end
+        end
+
+        if not results[1] then
+            error(results[2])
+        end
+        return unpack(results, 2)
+    end
+
+    screensaver_profile_hook_installed = true
+end
+
 function SleepRibbon:getProgress(expanded_text)
     local ui = self.ui
     if ui and ui.document and ui.getCurrentPage and ui.document.getPageCount then
@@ -598,7 +853,10 @@ function SleepRibbon:buildRibbonWidget(text, width, progress, face_override)
     if bar and bar_position == "top" then table.insert(children, bar) end
     table.insert(children, text_body)
     if bar and bar_position == "bottom" then table.insert(children, bar) end
-    return VerticalGroup:new(children)
+
+    local ribbon = VerticalGroup:new(children)
+    ribbon.sleepribbon_widget = true
+    return ribbon
 end
 
 function SleepRibbon:isNativeBannerCandidate(settings)
@@ -622,6 +880,46 @@ function SleepRibbon:installBannerHook()
         return original_textbox_new(class, settings, ...)
     end
     patch_installed = true
+end
+
+
+function SleepRibbon:installPositionOpacityHook()
+    if position_opacity_hook_installed then return end
+    original_customposition_new = CustomPositionContainer.new
+
+    CustomPositionContainer.new = function(class, settings, ...)
+        local instance = active_instance
+        local widget = type(settings) == "table" and settings.widget or nil
+        if instance and instance:isEnabled()
+                and Device.screen_saver_mode
+                and widget and widget.sleepribbon_widget
+                and instance:isCurrentBookProfileEnabled() then
+            local profile = instance:getCurrentBookProfile()
+            if type(profile) == "table" then
+                local patched = {}
+                for key, value in pairs(settings) do
+                    patched[key] = value
+                end
+
+                if profile[BOOK_POSITION_KEY] ~= nil then
+                    local position = tonumber(profile[BOOK_POSITION_KEY]) or 50
+                    position = math.max(0, math.min(100, position))
+                    patched.vertical_position = 1 - (position / 100)
+                end
+
+                if profile[BOOK_OPACITY_KEY] ~= nil then
+                    local opacity = tonumber(profile[BOOK_OPACITY_KEY]) or 100
+                    opacity = math.max(0, math.min(100, opacity))
+                    patched.alpha = opacity / 100
+                end
+
+                settings = patched
+            end
+        end
+        return original_customposition_new(class, settings, ...)
+    end
+
+    position_opacity_hook_installed = true
 end
 
 -- ---------------------------------------------------------------------------
@@ -840,13 +1138,28 @@ function SleepRibbon:selectUIFont(touchmenu_instance)
 end
 
 function SleepRibbon:selectFontFace(face, touchmenu_instance)
-    self.settings:saveSetting("use_ui_font", false)
-    self.settings:saveSetting("font_path", face.path)
-    self.settings:saveSetting("font_index", face.index or 0)
-    self.settings:saveSetting("font_label", face.label or face.style or basename(face.path))
-    self.settings:saveSetting("font_family", face.family or "")
-    self.settings:saveSetting("font_style", face.style or "")
-    self.settings:flush()
+    local font_settings = {
+        use_ui_font = false,
+        font_path = face.path,
+        font_index = face.index or 0,
+        font_label = face.label or face.style or basename(face.path),
+        font_family = face.family or "",
+        font_style = face.style or "",
+    }
+
+    if self:isCurrentBookProfileEnabled() then
+        local profile = self:getCurrentBookProfile() or {}
+        for key, value in pairs(font_settings) do
+            profile[key] = value
+        end
+        self:saveCurrentBookProfile(profile)
+    else
+        for key, value in pairs(font_settings) do
+            self.settings:saveSetting(key, value)
+        end
+        self.settings:flush()
+    end
+
     if touchmenu_instance then touchmenu_instance:updateItems() end
     self:showPreview()
 end
@@ -969,14 +1282,402 @@ function SleepRibbon:refreshFonts()
 end
 
 -- ---------------------------------------------------------------------------
+-- Cover-derived color palette
+-- ---------------------------------------------------------------------------
+
+local function paletteRGB(r, g, b)
+    local function channel(value)
+        return math.max(0, math.min(255, math.floor((tonumber(value) or 0) + 0.5)))
+    end
+    return { r = channel(r), g = channel(g), b = channel(b) }
+end
+
+local function paletteHex(color)
+    return string.format("#%02X%02X%02X", color.r, color.g, color.b)
+end
+
+local function paletteDistance(a, b)
+    local dr = a.r - b.r
+    local dg = a.g - b.g
+    local db = a.b - b.b
+    return math.sqrt(dr * dr + dg * dg + db * db)
+end
+
+local function paletteLuminance(color)
+    return 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b
+end
+
+local function paletteHSV(color)
+    local r, g, b = color.r / 255, color.g / 255, color.b / 255
+    local maxc = math.max(r, g, b)
+    local minc = math.min(r, g, b)
+    local delta = maxc - minc
+    local hue = 0
+
+    if delta > 0 then
+        if maxc == r then
+            hue = 60 * (((g - b) / delta) % 6)
+        elseif maxc == g then
+            hue = 60 * (((b - r) / delta) + 2)
+        else
+            hue = 60 * (((r - g) / delta) + 4)
+        end
+    end
+    if hue < 0 then hue = hue + 360 end
+
+    local saturation = maxc == 0 and 0 or (delta / maxc)
+    return hue, saturation, maxc
+end
+
+local function paletteSpectrumGroup(color)
+    local hue, saturation, value = paletteHSV(color)
+    local luminance = paletteLuminance(color)
+
+    -- At the dark extreme, perceived blackness matters more than computed hue.
+    if luminance <= 34 or value <= 0.15 then return 0 end
+
+    -- Low-saturation colors are kept together at the end, where they can move
+    -- naturally from gray through off-white to white.
+    if saturation < 0.16 then return 9 end
+
+    -- Fixed, predictable spectrum order.
+    if hue < 15 or hue >= 345 then return 1 end -- red
+    if hue < 45 then return 2 end -- orange / brown
+    if hue < 75 then return 3 end -- yellow
+    if hue < 165 then return 4 end -- green
+    if hue < 200 then return 5 end -- cyan
+    if hue < 255 then return 6 end -- blue
+    if hue < 290 then return 7 end -- violet
+    return 8 -- magenta
+end
+
+local function sortCoverPalette(colors)
+    table.sort(colors, function(a, b)
+        local ga, gb = paletteSpectrumGroup(a), paletteSpectrumGroup(b)
+        if ga ~= gb then return ga < gb end
+
+        local la, lb = paletteLuminance(a), paletteLuminance(b)
+        if math.abs(la - lb) >= 0.5 then return la < lb end
+
+        local ha, sa = paletteHSV(a)
+        local hb, sb = paletteHSV(b)
+        if math.abs(ha - hb) >= 0.5 then return ha < hb end
+        return sa > sb
+    end)
+end
+
+local function addPaletteBin(bins, color)
+    local qr = math.floor(color.r / 16)
+    local qg = math.floor(color.g / 16)
+    local qb = math.floor(color.b / 16)
+    local key = qr * 256 + qg * 16 + qb
+    local bin = bins[key]
+    if not bin then
+        bin = { count = 0, r = 0, g = 0, b = 0, key = key }
+        bins[key] = bin
+    end
+    bin.count = bin.count + 1
+    bin.r = bin.r + color.r
+    bin.g = bin.g + color.g
+    bin.b = bin.b + color.b
+end
+
+local function paletteCandidatesFromBins(bins)
+    local candidates = {}
+    for key, bin in pairs(bins) do
+        if bin.count > 0 then
+            local color = paletteRGB(
+                bin.r / bin.count,
+                bin.g / bin.count,
+                bin.b / bin.count
+            )
+            table.insert(candidates, {
+                color = color,
+                count = bin.count,
+                key = key,
+            })
+        end
+    end
+    table.sort(candidates, function(a, b)
+        if a.count == b.count then return a.key < b.key end
+        return a.count > b.count
+    end)
+    return candidates
+end
+
+local function averagedCoverBins(cover_bb, width, height)
+    -- Build a small spatial representation of the cover. Each grid cell is
+    -- averaged from several points, so brush strokes, paper texture and image
+    -- noise lose influence while the cover's large color masses remain.
+    local target_blocks = 1200
+    local grid_cols = math.max(1, math.floor(math.sqrt(target_blocks * width / height) + 0.5))
+    local grid_rows = math.max(1, math.floor(target_blocks / grid_cols + 0.5))
+    local samples_per_axis = 4
+    local bins = {}
+
+    for row = 0, grid_rows - 1 do
+        local y0 = math.floor(row * height / grid_rows)
+        local y1 = math.max(y0, math.floor((row + 1) * height / grid_rows) - 1)
+        for col = 0, grid_cols - 1 do
+            local x0 = math.floor(col * width / grid_cols)
+            local x1 = math.max(x0, math.floor((col + 1) * width / grid_cols) - 1)
+            local red, green, blue, samples = 0, 0, 0, 0
+
+            for sample_y = 0, samples_per_axis - 1 do
+                local py
+                if samples_per_axis == 1 or y1 == y0 then
+                    py = y0
+                else
+                    py = math.floor(y0 + (y1 - y0) * sample_y / (samples_per_axis - 1) + 0.5)
+                end
+                for sample_x = 0, samples_per_axis - 1 do
+                    local px
+                    if samples_per_axis == 1 or x1 == x0 then
+                        px = x0
+                    else
+                        px = math.floor(x0 + (x1 - x0) * sample_x / (samples_per_axis - 1) + 0.5)
+                    end
+
+                    local pixel = cover_bb:getPixel(px, py)
+                    if pixel and pixel.getColorRGB32 then
+                        local rgb32 = pixel:getColorRGB32()
+                        red = red + (tonumber(rgb32.r) or 0)
+                        green = green + (tonumber(rgb32.g) or 0)
+                        blue = blue + (tonumber(rgb32.b) or 0)
+                        samples = samples + 1
+                    end
+                end
+            end
+
+            if samples > 0 then
+                addPaletteBin(bins, paletteRGB(
+                    red / samples,
+                    green / samples,
+                    blue / samples
+                ))
+            end
+        end
+    end
+    return bins
+end
+
+local function accentCoverBins(cover_bb, width, height)
+    -- A second, sparse pass over raw pixels preserves small but unmistakable
+    -- accents (logos, lettering, isolated graphic elements). These colors may
+    -- enter the palette, but only a couple of slots are reserved for them.
+    local target_samples = 4200
+    local step = math.max(1, math.floor(math.sqrt((width * height) / target_samples)))
+    local bins = {}
+    local total = 0
+
+    for y = 0, height - 1, step do
+        for x = 0, width - 1, step do
+            local pixel = cover_bb:getPixel(x, y)
+            if pixel and pixel.getColorRGB32 then
+                local rgb32 = pixel:getColorRGB32()
+                local color = paletteRGB(rgb32.r, rgb32.g, rgb32.b)
+                local _, saturation, value = paletteHSV(color)
+                if saturation >= 0.52 and value >= 0.18 then
+                    addPaletteBin(bins, color)
+                end
+                total = total + 1
+            end
+        end
+    end
+    return bins, total
+end
+
+local function rawCoverBins(cover_bb, width, height)
+    -- Used only as a fallback when spatial averaging leaves fewer than 25
+    -- useful candidates. This restores fine shades on genuinely narrow
+    -- palettes without affecting complex covers that already fill the grid.
+    local target_samples = 6500
+    local step = math.max(1, math.floor(math.sqrt((width * height) / target_samples)))
+    local bins = {}
+
+    for y = 0, height - 1, step do
+        for x = 0, width - 1, step do
+            local pixel = cover_bb:getPixel(x, y)
+            if pixel and pixel.getColorRGB32 then
+                local rgb32 = pixel:getColorRGB32()
+                addPaletteBin(bins, paletteRGB(rgb32.r, rgb32.g, rgb32.b))
+            end
+        end
+    end
+    return bins
+end
+
+local function extractCoverPalette(cover_bb)
+    if not cover_bb then return nil end
+
+    local width = tonumber(cover_bb:getWidth()) or 0
+    local height = tonumber(cover_bb:getHeight()) or 0
+    if width <= 0 or height <= 0 then return nil end
+
+    local dominant_candidates = paletteCandidatesFromBins(
+        averagedCoverBins(cover_bb, width, height)
+    )
+    if #dominant_candidates == 0 then return nil end
+
+    local selected = {}
+    local function isDistinct(candidate, minimum_distance)
+        for selected_index = 1, #selected do
+            if paletteDistance(candidate, selected[selected_index]) <= minimum_distance then
+                return false
+            end
+        end
+        return true
+    end
+
+    local function addDominantColors(limit, minimum_distance)
+        for candidate_index = 1, #dominant_candidates do
+            if #selected >= limit then return end
+            local candidate = dominant_candidates[candidate_index].color
+            if isDistinct(candidate, minimum_distance) then
+                table.insert(selected, candidate)
+            end
+        end
+    end
+
+    -- Let dominant cover masses define most of the palette. Relaxing the
+    -- distance in stages retains a useful spectrum on covers with few colors.
+    addDominantColors(23, 72)
+    addDominantColors(23, 52)
+    addDominantColors(23, 36)
+    addDominantColors(23, 22)
+
+    local accent_bins, raw_sample_count = accentCoverBins(cover_bb, width, height)
+    local accent_candidates = paletteCandidatesFromBins(accent_bins)
+    local minimum_accent_count = math.max(3, math.floor(raw_sample_count * 0.0015 + 0.5))
+    local accents_added = 0
+
+    for candidate_index = 1, #accent_candidates do
+        if accents_added >= 2 or #selected >= 25 then break end
+        local entry = accent_candidates[candidate_index]
+        if entry.count >= minimum_accent_count
+            and isDistinct(entry.color, 58)
+        then
+            table.insert(selected, entry.color)
+            accents_added = accents_added + 1
+        end
+    end
+
+    -- If the cover did not need accent slots, fill the grid with finer shades
+    -- from its dominant families rather than inventing unrelated variety.
+    addDominantColors(25, 16)
+    addDominantColors(25, 8)
+    addDominantColors(25, 0)
+
+    if #selected < 25 then
+        local raw_candidates = paletteCandidatesFromBins(
+            rawCoverBins(cover_bb, width, height)
+        )
+        local function addRawColors(minimum_distance)
+            for candidate_index = 1, #raw_candidates do
+                if #selected >= 25 then return end
+                local candidate = raw_candidates[candidate_index].color
+                if isDistinct(candidate, minimum_distance) then
+                    table.insert(selected, candidate)
+                end
+            end
+        end
+        addRawColors(18)
+        addRawColors(10)
+        addRawColors(4)
+        addRawColors(0)
+    end
+
+    sortCoverPalette(selected)
+
+    local palette = {}
+    for color_index = 1, math.min(25, #selected) do
+        palette[color_index] = paletteHex(selected[color_index])
+    end
+    return #palette > 0 and palette or nil
+end
+
+function SleepRibbon:getPaletteBookFile()
+    local ui = self.ui
+    return (ui and ui.document and ui.document.file)
+        or G_reader_settings:readSetting("lastfile")
+end
+
+local COVER_PALETTE_CACHE_VERSION = 3
+
+function SleepRibbon:getCoverPaletteCache()
+    local cache = self.settings:readSetting("cover_palette_cache")
+    return type(cache) == "table" and cache or {}
+end
+
+function SleepRibbon:getCoverPalette(force_refresh)
+    local file = self:getPaletteBookFile()
+    if not file then
+        return nil, _("No book is available for a cover palette.")
+    end
+
+    local cache = self:getCoverPaletteCache()
+    local cached = cache[file]
+    if not force_refresh
+        and type(cached) == "table"
+        and cached.version == COVER_PALETTE_CACHE_VERSION
+        and type(cached.colors) == "table"
+        and #cached.colors > 0
+    then
+        return cached.colors
+    end
+
+    local bookinfo = self.ui and self.ui.bookinfo
+    if not bookinfo then
+        local ok, FileManagerBookInfo = pcall(require, "apps/filemanager/filemanagerbookinfo")
+        if ok then bookinfo = FileManagerBookInfo end
+    end
+    if not bookinfo or type(bookinfo.getCoverImage) ~= "function" then
+        return nil, _("No cover image is available for this book.")
+    end
+
+    local document = self.ui and self.ui.document
+    local ok_cover, cover_bb = pcall(bookinfo.getCoverImage, bookinfo, document, file)
+    if not ok_cover or not cover_bb then
+        return nil, _("No cover image is available for this book.")
+    end
+
+    local ok_palette, palette = pcall(extractCoverPalette, cover_bb)
+    if cover_bb.free then
+        pcall(cover_bb.free, cover_bb)
+    end
+    if not ok_palette or type(palette) ~= "table" or #palette == 0 then
+        if not ok_palette then
+            logger.warn("SleepRibbon: cover palette extraction failed:", palette)
+        end
+        return nil, _("Could not extract colors from the cover.")
+    end
+
+    cache[file] = {
+        version = COVER_PALETTE_CACHE_VERSION,
+        colors = palette,
+    }
+    self.settings:saveSetting("cover_palette_cache", cache):flush()
+    return palette
+end
+
+function SleepRibbon:refreshCoverPalette(touchmenu_instance)
+    local palette, err = self:getCoverPalette(true)
+    if palette then
+        Notification:notify(_("Cover palette refreshed"))
+        if touchmenu_instance then touchmenu_instance:updateItems() end
+    else
+        UIManager:show(InfoMessage:new{ text = err or _("Could not extract colors from the cover.") })
+    end
+end
+
+-- ---------------------------------------------------------------------------
 -- Color picker / preview
 -- ---------------------------------------------------------------------------
 
 function SleepRibbon:getPreviewMessage()
-    local message = G_reader_settings:readSetting("screensaver_message")
+    local message = self:getScopedMessage()
     if not message or message == "" then
-        local ok, Screensaver = pcall(require, "ui/screensaver")
-        message = ok and Screensaver.default_screensaver_message or KO_("Sleeping")
+        message = KO_("Sleeping")
     end
 
     local ui = self.ui
@@ -1014,6 +1715,9 @@ function SleepRibbon:showColorPicker(setting_key, title, touchmenu_instance)
         title = title,
         value = self:read(setting_key),
         default_value = DEFAULTS[setting_key],
+        cover_palette_provider = function()
+            return self:getCoverPalette(false)
+        end,
         callback = function(value)
             self:save(setting_key, value)
             if touchmenu_instance then touchmenu_instance:updateItems() end
@@ -1043,6 +1747,82 @@ end
 -- Menu
 -- ---------------------------------------------------------------------------
 
+function SleepRibbon:showMessageEditor(touchmenu_instance)
+    local FileManagerBookInfo = require("apps/filemanager/filemanagerbookinfo")
+    local InputDialog = require("ui/widget/inputdialog")
+    local input_dialog
+    input_dialog = InputDialog:new{
+        title = KO_("Sleep screen message"),
+        input = self:getScopedMessage(),
+        allow_newline = true,
+        buttons = {
+            {
+                {
+                    text = KO_("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(input_dialog)
+                    end,
+                },
+                {
+                    text = KO_("Info"),
+                    callback = FileManagerBookInfo.expandString,
+                },
+                {
+                    text = KO_("Set message"),
+                    callback = function()
+                        local text = input_dialog:getInputText()
+                        self:saveScopedMessage(text)
+                        UIManager:close(input_dialog)
+                        if touchmenu_instance then touchmenu_instance:updateItems() end
+                    end,
+                },
+            },
+        },
+    }
+    UIManager:show(input_dialog)
+    input_dialog:onShowKeyboard()
+end
+
+function SleepRibbon:showMessagePosition(touchmenu_instance)
+    UIManager:show(SpinWidget:new{
+        title_text = KO_("Adjust message position"),
+        info_text = KO_("Set the message's position as a percentage from the bottom of the screen.\n\n100% = top\n50% = middle\n0% = bottom"),
+        value = self:getScopedMessagePosition(),
+        value_min = 0,
+        value_max = 100,
+        value_step = 5,
+        value_hold_step = 1,
+        default_value = 50,
+        precision = "%.1f",
+        unit = "%",
+        ok_text = KO_("Set position"),
+        callback = function(spin)
+            self:saveScopedMessagePosition(spin.value)
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+    })
+end
+
+function SleepRibbon:showMessageOpacity(touchmenu_instance)
+    UIManager:show(SpinWidget:new{
+        title_text = KO_("Container opacity"),
+        info_text = KO_("Set the opacity level of the sleep screen message."),
+        value = self:getScopedMessageOpacity(),
+        value_min = 0,
+        value_max = 100,
+        value_step = 5,
+        value_hold_step = 1,
+        default_value = 100,
+        unit = "%",
+        ok_text = KO_("Set opacity"),
+        callback = function(spin)
+            self:saveScopedMessageOpacity(spin.value)
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+    })
+end
+
 function SleepRibbon:spinSetting(setting_key, title, min_value, max_value, default_value, unit, touchmenu_instance)
     UIManager:show(SpinWidget:new{
         title_text = title,
@@ -1064,331 +1844,348 @@ end
 function SleepRibbon:getMenuItem()
     return {
         text = "SleepRibbon",
-        help_text = _("Styles the native sleep-screen Banner. KOReader remains responsible for the cover, message tokens, opacity and vertical position."),
+        sorting_hint = "setting",
+        help_text = _("Configures and styles KOReader's native sleep-screen Banner, with optional per-book profiles."),
         sub_item_table = {
             {
                 text = _("Enabled"),
                 keep_menu_open = true,
                 checked_func = function() return self:isEnabled() end,
                 callback = function(touchmenu_instance)
-                    self:save("enabled", not self:isEnabled())
+                    self:saveGlobal("enabled", not self:isEnabled())
                     if touchmenu_instance then touchmenu_instance:updateItems() end
                 end,
+            },
+            {
+                text_func = function()
+                    local scope = self:isCurrentBookProfileEnabled() and _("Current book") or _("Global")
+                    return _("Profile") .. ": " .. scope
+                end,
+                sub_item_table = {
+                    {
+                        text = _("Global"),
+                        radio = true,
+                        keep_menu_open = true,
+                        checked_func = function() return not self:isCurrentBookProfileEnabled() end,
+                        callback = function(touchmenu_instance)
+                            self:setCurrentBookProfileEnabled(false)
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                        end,
+                    },
+                    {
+                        text = _("Current book"),
+                        radio = true,
+                        keep_menu_open = true,
+                        enabled_func = function() return self:hasCurrentBook() end,
+                        checked_func = function() return self:isCurrentBookProfileEnabled() end,
+                        callback = function(touchmenu_instance)
+                            self:setCurrentBookProfileEnabled(true)
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                        end,
+                    },
+                },
             },
             {
                 text = _("Preview"),
                 keep_menu_open = true,
                 callback = function() self:showPreview() end,
-                separator = true,
             },
             {
-                text_func = function() return _("Font") .. ": " .. self:getFontDisplayName() end,
-                sub_item_table_func = function() return self:buildFontMenu() end,
-            },
-            {
-                text_func = function() return _("Font size") .. ": " .. tostring(self:read("font_size")) end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    self:spinSetting("font_size", _("Font size"), 10, 48, DEFAULTS.font_size, nil, touchmenu_instance)
-                end,
-            },
-            {
-                text_func = function() return _("Text color") .. ": " .. tostring(self:read("text_color")) end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    self:showColorPicker("text_color", _("Text color"), touchmenu_instance)
-                end,
-            },
-            {
-                text_func = function()
-                    local value = self:read("text_alignment")
-                    local label = value == "left" and _("Left")
-                        or value == "right" and _("Right")
-                        or _("Center")
-                    return _("Text alignment") .. ": " .. label
-                end,
+                text = _("Sleep screen message"),
                 sub_item_table = {
                     {
-                        text = _("Left"),
-                        radio = true,
+                        text = _("Message"),
                         keep_menu_open = true,
-                        checked_func = function() return self:read("text_alignment") == "left" end,
                         callback = function(touchmenu_instance)
-                            self:save("text_alignment", "left")
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                            self:showMessageEditor(touchmenu_instance)
                         end,
                     },
                     {
-                        text = _("Center"),
-                        radio = true,
+                        text_func = function()
+                            return _("Position") .. ": " .. tostring(self:getScopedMessagePosition()) .. "%"
+                        end,
                         keep_menu_open = true,
-                        checked_func = function() return self:read("text_alignment") ~= "left" and self:read("text_alignment") ~= "right" end,
                         callback = function(touchmenu_instance)
-                            self:save("text_alignment", "center")
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                            self:showMessagePosition(touchmenu_instance)
                         end,
                     },
                     {
-                        text = _("Right"),
-                        radio = true,
+                        text_func = function()
+                            return _("Opacity") .. ": " .. tostring(self:getScopedMessageOpacity()) .. "%"
+                        end,
                         keep_menu_open = true,
-                        checked_func = function() return self:read("text_alignment") == "right" end,
                         callback = function(touchmenu_instance)
-                            self:save("text_alignment", "right")
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                            self:showMessageOpacity(touchmenu_instance)
                         end,
                     },
                 },
             },
             {
-                text_func = function()
-                    return _("Horizontal padding") .. ": " .. tostring(self:read("horizontal_padding")) .. " px"
-                end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    self:spinSetting(
-                        "horizontal_padding",
-                        _("Horizontal padding"),
-                        0, 100, DEFAULTS.horizontal_padding, "px",
-                        touchmenu_instance
-                    )
-                end,
+                text = _("Text"),
+                sub_item_table = {
+                    {
+                        text_func = function() return _("Font") .. ": " .. self:getFontDisplayName() end,
+                        sub_item_table_func = function() return self:buildFontMenu() end,
+                    },
+                    {
+                        text_func = function() return _("Font size") .. ": " .. tostring(self:read("font_size")) end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:spinSetting("font_size", _("Font size"), 10, 48, DEFAULTS.font_size, nil, touchmenu_instance)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            local value = self:read("text_alignment")
+                            local label = value == "left" and _("Left")
+                                or value == "right" and _("Right")
+                                or _("Center")
+                            return _("Text alignment") .. ": " .. label
+                        end,
+                        sub_item_table = {
+                            {
+                                text = _("Left"), radio = true, keep_menu_open = true,
+                                checked_func = function() return self:read("text_alignment") == "left" end,
+                                callback = function(touchmenu_instance)
+                                    self:save("text_alignment", "left")
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            },
+                            {
+                                text = _("Center"), radio = true, keep_menu_open = true,
+                                checked_func = function()
+                                    return self:read("text_alignment") ~= "left" and self:read("text_alignment") ~= "right"
+                                end,
+                                callback = function(touchmenu_instance)
+                                    self:save("text_alignment", "center")
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            },
+                            {
+                                text = _("Right"), radio = true, keep_menu_open = true,
+                                checked_func = function() return self:read("text_alignment") == "right" end,
+                                callback = function(touchmenu_instance)
+                                    self:save("text_alignment", "right")
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            },
+                        },
+                    },
+                    {
+                        text_func = function()
+                            return _("Horizontal padding") .. ": " .. tostring(self:read("horizontal_padding")) .. " px"
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:spinSetting(
+                                "horizontal_padding",
+                                _("Horizontal padding"),
+                                0, math.max(100, math.floor((Screen:getWidth() - 1) / 2)),
+                                DEFAULTS.horizontal_padding, "px",
+                                touchmenu_instance
+                            )
+                        end,
+                    },
+                    {
+                        text_func = function() return _("Text color") .. ": " .. tostring(self:read("text_color")) end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:showColorPicker("text_color", _("Text color"), touchmenu_instance)
+                        end,
+                    },
+                },
             },
             {
                 text = _("Background"),
-                keep_menu_open = true,
-                checked_func = function() return self:read("background_enabled") and true or false end,
-                callback = function(touchmenu_instance)
-                    self:save("background_enabled", not self:read("background_enabled"))
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                end,
-            },
-            {
-                text_func = function() return _("Background color") .. ": " .. tostring(self:read("background_color")) end,
-                keep_menu_open = true,
-                enabled_func = function() return self:read("background_enabled") and true or false end,
-                callback = function(touchmenu_instance)
-                    self:showColorPicker("background_color", _("Background color"), touchmenu_instance)
-                end,
-            },
-            {
-                text_func = function()
-                    return _("Ribbon vertical padding") .. ": " .. tostring(self:read("vertical_padding")) .. " px"
-                end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    self:spinSetting("vertical_padding", _("Ribbon vertical padding"), 0, 30, DEFAULTS.vertical_padding, "px", touchmenu_instance)
-                end,
-                separator = true,
+                sub_item_table = {
+                    {
+                        text = _("Enabled"),
+                        keep_menu_open = true,
+                        checked_func = function() return self:read("background_enabled") and true or false end,
+                        callback = function(touchmenu_instance)
+                            self:save("background_enabled", not self:read("background_enabled"))
+                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                        end,
+                    },
+                    {
+                        text_func = function() return _("Background color") .. ": " .. tostring(self:read("background_color")) end,
+                        keep_menu_open = true,
+                        enabled_func = function() return self:read("background_enabled") and true or false end,
+                        callback = function(touchmenu_instance)
+                            self:showColorPicker("background_color", _("Background color"), touchmenu_instance)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            return _("Ribbon vertical padding") .. ": " .. tostring(self:read("vertical_padding")) .. " px"
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            self:spinSetting(
+                                "vertical_padding",
+                                _("Ribbon vertical padding"),
+                                0, 30, DEFAULTS.vertical_padding, "px",
+                                touchmenu_instance
+                            )
+                        end,
+                    },
+                },
             },
             {
                 text = _("Progress bar"),
-                keep_menu_open = true,
-                checked_func = function() return self:read("progress_enabled") and true or false end,
-                callback = function(touchmenu_instance)
-                    self:save("progress_enabled", not self:read("progress_enabled"))
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                end,
-            },
-            {
-                text_func = function()
-                    return _("Bar position") .. ": " .. (self:read("progress_position") == "bottom" and _("Bottom") or _("Top"))
-                end,
-                enabled_func = function() return self:read("progress_enabled") and true or false end,
                 sub_item_table = {
                     {
-                        text = _("Top"), radio = true, keep_menu_open = true,
-                        checked_func = function() return self:read("progress_position") ~= "bottom" end,
+                        text = _("Enabled"),
+                        keep_menu_open = true,
+                        checked_func = function() return self:read("progress_enabled") and true or false end,
                         callback = function(touchmenu_instance)
-                            self:save("progress_position", "top")
+                            self:save("progress_enabled", not self:read("progress_enabled"))
                             if touchmenu_instance then touchmenu_instance:updateItems() end
                         end,
                     },
                     {
-                        text = _("Bottom"), radio = true, keep_menu_open = true,
-                        checked_func = function() return self:read("progress_position") == "bottom" end,
+                        text_func = function()
+                            return _("Bar position") .. ": "
+                                .. (self:read("progress_position") == "bottom" and _("Bottom") or _("Top"))
+                        end,
+                        enabled_func = function() return self:read("progress_enabled") and true or false end,
+                        sub_item_table = {
+                            {
+                                text = _("Top"), radio = true, keep_menu_open = true,
+                                checked_func = function() return self:read("progress_position") ~= "bottom" end,
+                                callback = function(touchmenu_instance)
+                                    self:save("progress_position", "top")
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            },
+                            {
+                                text = _("Bottom"), radio = true, keep_menu_open = true,
+                                checked_func = function() return self:read("progress_position") == "bottom" end,
+                                callback = function(touchmenu_instance)
+                                    self:save("progress_position", "bottom")
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            },
+                        },
+                    },
+                    {
+                        text_func = function()
+                            local mode = self:read("progress_show_remainder")
+                                and _("Completed + remaining") or _("Completed only")
+                            return _("Style") .. ": " .. mode
+                        end,
+                        enabled_func = function() return self:read("progress_enabled") and true or false end,
+                        sub_item_table = {
+                            {
+                                text = _("Completed only"), radio = true, keep_menu_open = true,
+                                checked_func = function() return not self:read("progress_show_remainder") end,
+                                callback = function(touchmenu_instance)
+                                    self:save("progress_show_remainder", false)
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            },
+                            {
+                                text = _("Completed + remaining"), radio = true, keep_menu_open = true,
+                                checked_func = function() return self:read("progress_show_remainder") and true or false end,
+                                callback = function(touchmenu_instance)
+                                    self:save("progress_show_remainder", true)
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            },
+                        },
+                    },
+                    {
+                        text_func = function()
+                            return _("Bar thickness") .. ": " .. tostring(self:read("progress_height")) .. " px"
+                        end,
+                        keep_menu_open = true,
+                        enabled_func = function() return self:read("progress_enabled") and true or false end,
                         callback = function(touchmenu_instance)
-                            self:save("progress_position", "bottom")
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                            self:spinSetting(
+                                "progress_height", _("Bar thickness"),
+                                1, 20, DEFAULTS.progress_height, "px",
+                                touchmenu_instance
+                            )
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            return _("Completed progress color") .. ": " .. tostring(self:read("progress_color"))
+                        end,
+                        keep_menu_open = true,
+                        enabled_func = function() return self:read("progress_enabled") and true or false end,
+                        callback = function(touchmenu_instance)
+                            self:showColorPicker("progress_color", _("Completed progress color"), touchmenu_instance)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            return _("Remaining progress color") .. ": " .. tostring(self:read("remainder_color"))
+                        end,
+                        keep_menu_open = true,
+                        enabled_func = function()
+                            return self:read("progress_enabled") and self:read("progress_show_remainder") and true or false
+                        end,
+                        callback = function(touchmenu_instance)
+                            self:showColorPicker("remainder_color", _("Remaining progress color"), touchmenu_instance)
                         end,
                     },
                 },
             },
             {
-                text_func = function()
-                    local mode = self:read("progress_show_remainder") and _("Completed + remaining") or _("Completed only")
-                    return _("Progress display") .. ": " .. mode
-                end,
-                enabled_func = function() return self:read("progress_enabled") and true or false end,
+                text = _("Maintenance"),
                 sub_item_table = {
                     {
-                        text = _("Completed only"), radio = true, keep_menu_open = true,
-                        checked_func = function() return not self:read("progress_show_remainder") end,
+                        text = _("Refresh font list"),
+                        keep_menu_open = true,
                         callback = function(touchmenu_instance)
-                            self:save("progress_show_remainder", false)
+                            self:refreshFonts()
                             if touchmenu_instance then touchmenu_instance:updateItems() end
                         end,
                     },
                     {
-                        text = _("Completed + remaining"), radio = true, keep_menu_open = true,
-                        checked_func = function() return self:read("progress_show_remainder") and true or false end,
+                        text = _("Refresh cover palette"),
+                        keep_menu_open = true,
                         callback = function(touchmenu_instance)
-                            self:save("progress_show_remainder", true)
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                            self:refreshCoverPalette(touchmenu_instance)
+                        end,
+                    },
+                    {
+                        text_func = function()
+                            return self:isCurrentBookProfileEnabled()
+                                and _("Reset current book profile")
+                                or _("Restore global defaults")
+                        end,
+                        keep_menu_open = true,
+                        callback = function(touchmenu_instance)
+                            local current_book = self:isCurrentBookProfileEnabled()
+                            UIManager:show(ConfirmBox:new{
+                                text = current_book
+                                    and _("Reset the current book profile and inherit global settings?")
+                                    or _("Restore global SleepRibbon defaults?"),
+                                ok_text = _("Restore"),
+                                ok_callback = function()
+                                    if current_book then
+                                        self:resetCurrentBookProfile()
+                                        Notification:notify(_("Current book profile reset"))
+                                    else
+                                        self:resetDefaults()
+                                        Notification:notify(_("Global SleepRibbon defaults restored"))
+                                    end
+                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                end,
+                            })
                         end,
                     },
                 },
-            },
-            {
-                text_func = function()
-                    return _("Bar thickness") .. ": " .. tostring(self:read("progress_height")) .. " px"
-                end,
-                keep_menu_open = true,
-                enabled_func = function() return self:read("progress_enabled") and true or false end,
-                callback = function(touchmenu_instance)
-                    self:spinSetting("progress_height", _("Bar thickness"), 1, 20, DEFAULTS.progress_height, "px", touchmenu_instance)
-                end,
-            },
-            {
-                text_func = function() return _("Completed progress color") .. ": " .. tostring(self:read("progress_color")) end,
-                keep_menu_open = true,
-                enabled_func = function() return self:read("progress_enabled") and true or false end,
-                callback = function(touchmenu_instance)
-                    self:showColorPicker("progress_color", _("Completed progress color"), touchmenu_instance)
-                end,
-            },
-            {
-                text_func = function() return _("Remaining progress color") .. ": " .. tostring(self:read("remainder_color")) end,
-                keep_menu_open = true,
-                enabled_func = function()
-                    return self:read("progress_enabled") and self:read("progress_show_remainder") and true or false
-                end,
-                callback = function(touchmenu_instance)
-                    self:showColorPicker("remainder_color", _("Remaining progress color"), touchmenu_instance)
-                end,
-                separator = true,
-            },
-            {
-                text = _("Refresh font list"),
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    self:refreshFonts()
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                end,
-            },
-            {
-                text = _("Restore SleepRibbon defaults"),
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    UIManager:show(ConfirmBox:new{
-                        text = _("Restore SleepRibbon's default appearance?"),
-                        ok_text = _("Restore"),
-                        ok_callback = function()
-                            self:resetDefaults()
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
-                            Notification:notify(_("SleepRibbon defaults restored"))
-                        end,
-                    })
-                end,
             },
         },
     }
 end
 
-local function findItemFromPath(menu, ...)
-    local function findSubItem(sub_items, text)
-        if type(sub_items) ~= "table" then return nil end
-        for _, item in ipairs(sub_items) do
-            local item_text = item.text or (item.text_func and item.text_func())
-            if item_text and item_text == text then
-                return item
-            end
-        end
-        return nil
-    end
-
-    local sub_items, item
-    for _, text in ipairs{ ... } do
-        sub_items = item and item.sub_item_table or menu
-        if not sub_items then return nil end
-        item = findSubItem(sub_items, text)
-        if not item then return nil end
-    end
-    return item
-end
-
-local function insertSleepRibbonInBuiltMenu(menu, order, instance)
-    if not (menu and order and instance and menu.tab_item_table) then return false end
-
-    local buttons = order["KOMenu:menu_buttons"]
-    if type(buttons) ~= "table" then return false end
-
-    for i, button in ipairs(buttons) do
-        if button == "setting" then
-            local setting_menu = menu.tab_item_table[i]
-            if setting_menu then
-                local sleep_screen = findItemFromPath(
-                    setting_menu,
-                    KO_("Screen"),
-                    KO_("Sleep screen")
-                )
-                local items = sleep_screen and sleep_screen.sub_item_table
-                if type(items) ~= "table" then return false end
-
-                -- Idempotent: the final menu tree may be rebuilt more than once.
-                for _, item in ipairs(items) do
-                    if item.text == "SleepRibbon" then return true end
-                end
-
-                local insert_at = #items + 1
-                for idx, item in ipairs(items) do
-                    local item_text = item.text or (item.text_func and item.text_func())
-                    if item_text == KO_("Container and position") then
-                        insert_at = idx + 1
-                        break
-                    end
-                end
-
-                table.insert(items, insert_at, instance:getMenuItem())
-                return true
-            end
-        end
-    end
-    return false
-end
-
-function SleepRibbon:installMenuHooks()
-    if menu_hooks_installed then return end
-
-    local original_reader_set = ReaderMenu.setUpdateItemTable
-    ReaderMenu.setUpdateItemTable = function(menu, ...)
-        local result = original_reader_set(menu, ...)
-        local instance = menu_instances[menu] or active_instance
-        if instance then
-            local ok, err = pcall(insertSleepRibbonInBuiltMenu, menu, ReaderMenuOrder, instance)
-            if not ok then logger.warn("SleepRibbon: Reader menu injection failed:", err) end
-        end
-        return result
-    end
-
-    local original_filemanager_set = FileManagerMenu.setUpdateItemTable
-    FileManagerMenu.setUpdateItemTable = function(menu, ...)
-        local result = original_filemanager_set(menu, ...)
-        local instance = menu_instances[menu] or active_instance
-        if instance then
-            local ok, err = pcall(insertSleepRibbonInBuiltMenu, menu, FileManagerMenuOrder, instance)
-            if not ok then logger.warn("SleepRibbon: File Manager menu injection failed:", err) end
-        end
-        return result
-    end
-
-    menu_hooks_installed = true
-end
-
-function SleepRibbon:addToMainMenu(_menu_items)
-    -- Intentionally empty. SleepRibbon is injected only after KOReader has
-    -- built the real menu tree, so it appears at:
-    -- Settings > Screen > Sleep screen > SleepRibbon.
+function SleepRibbon:addToMainMenu(menu_items)
+    if type(menu_items) ~= "table" then return end
+    menu_items.sleepribbon = self:getMenuItem()
 end
 
 return SleepRibbon
