@@ -2,6 +2,22 @@
 
 
 
+## [1.2.0] - 2026-11-15
+
+### Added
+
+- Full-screen sleep-screen preview, displaying the configured sleep-screen image with the SleepRibbon overlay.
+- Automatic preview after confirmed changes to message, typography, colors, layout, position, opacity and progress-bar settings.
+- Automatic preview when switching between Global and Current book profiles.
+
+### Changed
+
+- Replaced the previous ribbon-only preview dialog with a full-screen representation of the sleep screen.
+- Preview now follows KOReader's applicable sleep-screen image selection, scaling and rotation settings.
+- Preview preserves the current frontlight state without entering sleep mode.
+- Dismissing the preview returns to the previous menu. Automatic previews are skipped when settings remain unchanged.
+
+
 ## \[1.1.0] - 2026-09-30
 
 ### Added
