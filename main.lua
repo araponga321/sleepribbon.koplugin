@@ -244,67 +244,7 @@ function TransparentTextBoxWidget:paintTo(bb, x, y)
     end
 end
 
--- ---------------------------------------------------------------------------
--- Preview
--- ---------------------------------------------------------------------------
-
-local PreviewDialog = InputContainer:extend{
-    modal = true,
-    ribbon_widget = nil,
-}
-
-function PreviewDialog:init()
-    self.ges_events = {
-        TapClose = {
-            GestureRange:new{
-                ges = "tap",
-                range = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() },
-            },
-        },
-    }
-
-    local title = TextWidget:new{
-        text = _("SleepRibbon preview"),
-        face = Font:getFace("smalltfont"),
-    }
-    local hint = TextWidget:new{
-        text = _("Tap anywhere to close"),
-        face = Font:getFace("smallinfofont"),
-        fgcolor = Blitbuffer.COLOR_DARK_GRAY,
-    }
-
-    local preview_holder = FrameContainer:new{
-        background = Blitbuffer.COLOR_LIGHT_GRAY,
-        bordersize = Size.border.thin,
-        padding = Size.padding.large,
-        self.ribbon_widget,
-    }
-
-    local panel = FrameContainer:new{
-        background = Blitbuffer.COLOR_WHITE,
-        radius = Size.radius.window,
-        bordersize = Size.border.window,
-        padding = Size.padding.large,
-        VerticalGroup:new{
-            align = "center",
-            title,
-            VerticalSpan:new{ width = Size.padding.large },
-            preview_holder,
-            VerticalSpan:new{ width = Size.padding.large },
-            hint,
-        },
-    }
-
-    self[1] = CenterContainer:new{
-        dimen = Screen:getSize(),
-        panel,
-    }
-end
-
-function PreviewDialog:onTapClose()
-    UIManager:close(self)
-    return true
-end
+-- The full-screen preview is implemented in sleepribbon_preview.lua.
 
 -- ---------------------------------------------------------------------------
 -- Plugin object and settings
@@ -466,6 +406,21 @@ function SleepRibbon:save(key, value)
         return
     end
     self:saveGlobal(key, value)
+end
+
+-- Only confirmed visual edits trigger a preview.  Keep menu refresh before
+-- showPreview(), which defers the full-screen overlay to the next UI tick.
+-- This method is deliberately not part of save(): non-UI writes must not
+-- unexpectedly interrupt the reader with a full-screen preview.
+function SleepRibbon:refreshMenuAndPreview(touchmenu_instance, changed)
+    if touchmenu_instance then touchmenu_instance:updateItems() end
+    if changed then self:showPreview() end
+end
+
+function SleepRibbon:saveVisualSetting(key, value, touchmenu_instance)
+    local changed = self:read(key) ~= value
+    if changed then self:save(key, value) end
+    self:refreshMenuAndPreview(touchmenu_instance, changed)
 end
 
 function SleepRibbon:getDefaultSleepMessage()
@@ -1719,28 +1674,15 @@ function SleepRibbon:showColorPicker(setting_key, title, touchmenu_instance)
             return self:getCoverPalette(false)
         end,
         callback = function(value)
-            self:save(setting_key, value)
-            if touchmenu_instance then touchmenu_instance:updateItems() end
+            self:saveVisualSetting(setting_key, value, touchmenu_instance)
         end,
     }
 end
 
 function SleepRibbon:showPreview(face_override)
-    local width = math.floor(Screen:getWidth() * 0.82)
-    local preview_text = self:getPreviewMessage()
-    local ribbon = self:buildRibbonWidget(
-        preview_text,
-        width,
-        self:getProgress(preview_text),
-        face_override
-    )
-    local preview = PreviewDialog:new{ ribbon_widget = ribbon }
-
-    -- TouchMenu may repaint itself after a keep_menu_open callback returns.
-    -- Defer the preview by one UI tick so it is pushed above the retained menu.
-    UIManager:nextTick(function()
-        UIManager:show(preview)
-    end)
+    -- Keep the preview as a normal KOReader screen. In particular, do not enter
+    -- Device.screen_saver_mode: that is reserved for real sleep/suspend.
+    require("sleepribbon_preview").show(self, face_override)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1772,9 +1714,10 @@ function SleepRibbon:showMessageEditor(touchmenu_instance)
                     text = KO_("Set message"),
                     callback = function()
                         local text = input_dialog:getInputText()
+                        local old_message = self:getScopedMessage()
                         self:saveScopedMessage(text)
                         UIManager:close(input_dialog)
-                        if touchmenu_instance then touchmenu_instance:updateItems() end
+                        self:refreshMenuAndPreview(touchmenu_instance, old_message ~= self:getScopedMessage())
                     end,
                 },
             },
@@ -1798,8 +1741,9 @@ function SleepRibbon:showMessagePosition(touchmenu_instance)
         unit = "%",
         ok_text = KO_("Set position"),
         callback = function(spin)
+            local changed = self:getScopedMessagePosition() ~= spin.value
             self:saveScopedMessagePosition(spin.value)
-            if touchmenu_instance then touchmenu_instance:updateItems() end
+            self:refreshMenuAndPreview(touchmenu_instance, changed)
         end,
     })
 end
@@ -1817,8 +1761,9 @@ function SleepRibbon:showMessageOpacity(touchmenu_instance)
         unit = "%",
         ok_text = KO_("Set opacity"),
         callback = function(spin)
+            local changed = self:getScopedMessageOpacity() ~= spin.value
             self:saveScopedMessageOpacity(spin.value)
-            if touchmenu_instance then touchmenu_instance:updateItems() end
+            self:refreshMenuAndPreview(touchmenu_instance, changed)
         end,
     })
 end
@@ -1835,8 +1780,7 @@ function SleepRibbon:spinSetting(setting_key, title, min_value, max_value, defau
         unit = unit,
         ok_text = _("Set"),
         callback = function(spin)
-            self:save(setting_key, spin.value)
-            if touchmenu_instance then touchmenu_instance:updateItems() end
+            self:saveVisualSetting(setting_key, spin.value, touchmenu_instance)
         end,
     })
 end
@@ -1868,8 +1812,9 @@ function SleepRibbon:getMenuItem()
                         keep_menu_open = true,
                         checked_func = function() return not self:isCurrentBookProfileEnabled() end,
                         callback = function(touchmenu_instance)
-                            self:setCurrentBookProfileEnabled(false)
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                            local was_book_profile = self:isCurrentBookProfileEnabled()
+                            local saved = self:setCurrentBookProfileEnabled(false)
+                            self:refreshMenuAndPreview(touchmenu_instance, saved and was_book_profile)
                         end,
                     },
                     {
@@ -1879,8 +1824,9 @@ function SleepRibbon:getMenuItem()
                         enabled_func = function() return self:hasCurrentBook() end,
                         checked_func = function() return self:isCurrentBookProfileEnabled() end,
                         callback = function(touchmenu_instance)
-                            self:setCurrentBookProfileEnabled(true)
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                            local was_book_profile = self:isCurrentBookProfileEnabled()
+                            local saved = self:setCurrentBookProfileEnabled(true)
+                            self:refreshMenuAndPreview(touchmenu_instance, saved and not was_book_profile)
                         end,
                     },
                 },
@@ -1947,8 +1893,7 @@ function SleepRibbon:getMenuItem()
                                 text = _("Left"), radio = true, keep_menu_open = true,
                                 checked_func = function() return self:read("text_alignment") == "left" end,
                                 callback = function(touchmenu_instance)
-                                    self:save("text_alignment", "left")
-                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                    self:saveVisualSetting("text_alignment", "left", touchmenu_instance)
                                 end,
                             },
                             {
@@ -1957,16 +1902,14 @@ function SleepRibbon:getMenuItem()
                                     return self:read("text_alignment") ~= "left" and self:read("text_alignment") ~= "right"
                                 end,
                                 callback = function(touchmenu_instance)
-                                    self:save("text_alignment", "center")
-                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                    self:saveVisualSetting("text_alignment", "center", touchmenu_instance)
                                 end,
                             },
                             {
                                 text = _("Right"), radio = true, keep_menu_open = true,
                                 checked_func = function() return self:read("text_alignment") == "right" end,
                                 callback = function(touchmenu_instance)
-                                    self:save("text_alignment", "right")
-                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                    self:saveVisualSetting("text_alignment", "right", touchmenu_instance)
                                 end,
                             },
                         },
@@ -2003,8 +1946,7 @@ function SleepRibbon:getMenuItem()
                         keep_menu_open = true,
                         checked_func = function() return self:read("background_enabled") and true or false end,
                         callback = function(touchmenu_instance)
-                            self:save("background_enabled", not self:read("background_enabled"))
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                            self:saveVisualSetting("background_enabled", not self:read("background_enabled"), touchmenu_instance)
                         end,
                     },
                     {
@@ -2039,8 +1981,7 @@ function SleepRibbon:getMenuItem()
                         keep_menu_open = true,
                         checked_func = function() return self:read("progress_enabled") and true or false end,
                         callback = function(touchmenu_instance)
-                            self:save("progress_enabled", not self:read("progress_enabled"))
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
+                            self:saveVisualSetting("progress_enabled", not self:read("progress_enabled"), touchmenu_instance)
                         end,
                     },
                     {
@@ -2054,16 +1995,14 @@ function SleepRibbon:getMenuItem()
                                 text = _("Top"), radio = true, keep_menu_open = true,
                                 checked_func = function() return self:read("progress_position") ~= "bottom" end,
                                 callback = function(touchmenu_instance)
-                                    self:save("progress_position", "top")
-                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                    self:saveVisualSetting("progress_position", "top", touchmenu_instance)
                                 end,
                             },
                             {
                                 text = _("Bottom"), radio = true, keep_menu_open = true,
                                 checked_func = function() return self:read("progress_position") == "bottom" end,
                                 callback = function(touchmenu_instance)
-                                    self:save("progress_position", "bottom")
-                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                    self:saveVisualSetting("progress_position", "bottom", touchmenu_instance)
                                 end,
                             },
                         },
@@ -2080,16 +2019,14 @@ function SleepRibbon:getMenuItem()
                                 text = _("Completed only"), radio = true, keep_menu_open = true,
                                 checked_func = function() return not self:read("progress_show_remainder") end,
                                 callback = function(touchmenu_instance)
-                                    self:save("progress_show_remainder", false)
-                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                    self:saveVisualSetting("progress_show_remainder", false, touchmenu_instance)
                                 end,
                             },
                             {
                                 text = _("Completed + remaining"), radio = true, keep_menu_open = true,
                                 checked_func = function() return self:read("progress_show_remainder") and true or false end,
                                 callback = function(touchmenu_instance)
-                                    self:save("progress_show_remainder", true)
-                                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                                    self:saveVisualSetting("progress_show_remainder", true, touchmenu_instance)
                                 end,
                             },
                         },
