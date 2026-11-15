@@ -22,7 +22,8 @@ Rather than placing a large information panel over the cover, SleepRibbon styles
 - Custom text and banner background colors
 - The banner background can be disabled entirely
 - Optional progress bar, above or below the message, with completed-only or completed + remaining styles, configurable thickness and independent colors
-- Live preview of the current global or per-book configuration
+- Full-screen preview of the sleep screen, combining the applicable cover or background image with the configured ribbon
+- Automatic preview after confirmed configuration changes, without suspending the device or changing the frontlight intensity
 - Persistent fallback for KOReader's `%H` time-remaining token
 - English, Portuguese and Spanish interface
 - No polling, background timers or periodic tasks
@@ -41,6 +42,18 @@ SleepRibbon provides two configuration scopes:
 Per-book settings are stored with the book's KOReader document settings, so each book can keep its own message, typography, colors, layout and progress-bar appearance.
 
 > **SleepRibbon requires the native sleep-screen message container to be set to Banner. The Box container is not styled by the plugin.**
+
+### Full-screen preview
+
+SleepRibbon provides a full-screen preview of the configured sleep screen, displaying the applicable cover or background image with the ribbon overlaid in its actual position.
+
+The preview follows KOReader's sleep-screen image settings, including scaling and rotation, while respecting the selected Global or Current book profile.
+
+Preview opens automatically after confirmed changes to visual settings, allowing users to evaluate the result immediately without navigating back to the main menu. Changes that do not modify the current configuration do not trigger another preview.
+
+Tap anywhere to close the preview and return to the previous menu. The preview does not suspend the device or change the current frontlight intensity.
+
+Manual preview remains available from the SleepRibbon menu.
 
 ### Message tokens
 
