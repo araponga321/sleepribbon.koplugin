@@ -109,7 +109,7 @@ No additional patch is required.
 | Setting | Description |
 |---|---|
 | Profile | Switches between the Global configuration and the Current book profile |
-| Preview | Shows the current configuration using the expanded sleep-screen message |
+| Preview | Shows a full-screen preview of the sleep-screen image and configured ribbon; also opens automatically after confirmed configuration changes |
 | Message | Edits the native sleep-screen message for the selected profile |
 | Position | Adjusts the vertical position of the message |
 | Opacity | Adjusts the sleep-screen message container opacity |
@@ -187,7 +187,7 @@ Its work is limited to configuration, preview generation, cover-palette extracti
 
 ## Compatibility
 
-SleepRibbon v1.1.0 has been tested with:
+SleepRibbon v1.2.0 has been tested with:
 
 - KOReader emulator based on v2026.07.2
 - Kindle Colorsoft
